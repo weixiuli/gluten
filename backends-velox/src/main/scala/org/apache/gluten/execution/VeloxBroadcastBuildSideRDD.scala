@@ -18,6 +18,9 @@ package org.apache.gluten.execution
 
 import org.apache.gluten.iterator.Iterators
 
+import org.apache.gluten.execution.VeloxDriverHashTableSupport
+import org.apache.gluten.execution.VeloxUnsafeHashRelation
+
 import org.apache.spark.{broadcast, SparkContext}
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -29,8 +32,18 @@ case class VeloxBroadcastBuildSideRDD(
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
     val relation = broadcasted.value.asReadOnlyCopy()
+    val batches = relation match {
+      case hashed: VeloxUnsafeHashRelation =>
+        VeloxDriverHashTableSupport.ensureHashTableRegistered(hashed)
+        VeloxDriverHashTableSupport
+          .fakeBroadcastBatch(hashed)
+          .map(Iterator.single)
+          .getOrElse(hashed.delegate.deserialized)
+      case _ =>
+        relation.deserialized
+    }
     Iterators
-      .wrap(relation.deserialized)
+      .wrap(batches)
       .recyclePayload(batch => batch.close())
       .create()
   }

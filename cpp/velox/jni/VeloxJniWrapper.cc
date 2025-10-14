@@ -32,12 +32,30 @@
 #include "jni/JniFileSystem.h"
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
+#include "operators/serializer/VeloxColumnarBatchSerializer.h"
 #include "shuffle/rss/RssPartitionWriter.h"
 #include "substrait/SubstraitToVeloxPlanValidator.h"
 #include "utils/ObjectStore.h"
 #include "utils/VeloxBatchResizer.h"
 #include "velox/common/base/BloomFilter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/ByteStream.h"
+#include "velox/serializers/PrestoSerializer.h"
+#include "velox/type/Type.h"
+
+#include <arrow/c/bridge.h>
+#include <folly/io/IOBuf.h>
+
+#if defined(__has_include)
+#if __has_include(<velox/exec/HashTableSerializer.h>)
+#include <velox/exec/HashTableSerializer.h>
+#define GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION 1
+#else
+#define GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION 0
+#endif
+#else
+#define GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION 0
+#endif
 
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/CudfPlanValidator.h"
@@ -810,6 +828,166 @@ JNIEXPORT jobjectArray JNICALL Java_org_apache_gluten_execution_IcebergWriteJniW
   return ret;
 
   JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_buildHashTableNative( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong runtimeHandle,
+    jlong cSchema,
+    jobjectArray serializedBatches,
+    jintArray keyOrdinals,
+    jboolean nullAware,
+    jstring tableId) {
+  JNI_METHOD_START
+#if GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION
+  auto runtime = jniCastOrThrow<Runtime>(runtimeHandle);
+  auto veloxRuntime = dynamic_cast<VeloxRuntime*>(runtime);
+  GLUTEN_CHECK(veloxRuntime != nullptr, "Velox runtime is required for hash table serialization");
+
+  auto* memoryManager = veloxRuntime->memoryManager();
+  auto leafPool = memoryManager->getLeafMemoryPool();
+  auto arrowPool = memoryManager->defaultArrowMemoryPool();
+
+  auto arrowSchemaPtr = reinterpret_cast<struct ArrowSchema*>(cSchema);
+  auto arrowSchema = gluten::arrowGetOrThrow(arrow::ImportSchema(arrowSchemaPtr));
+  ArrowSchema schemaCopy;
+  GLUTEN_THROW_NOT_OK(arrow::ExportSchema(*arrowSchema, &schemaCopy));
+  VeloxColumnarBatchSerializer batchSerializer(arrowPool, leafPool, &schemaCopy);
+
+  const jsize batchCount = env->GetArrayLength(serializedBatches);
+  std::vector<RowVectorPtr> buildVectors;
+  buildVectors.reserve(batchCount);
+  for (jsize idx = 0; idx < batchCount; ++idx) {
+    auto jBytes = static_cast<jbyteArray>(env->GetObjectArrayElement(serializedBatches, idx));
+    auto safeBytes = gluten::getByteArrayElementsSafe(env, jBytes);
+    auto columnarBatch = batchSerializer.deserialize(
+        reinterpret_cast<uint8_t*>(safeBytes.elems()),
+        safeBytes.length());
+    auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(columnarBatch);
+    GLUTEN_CHECK(
+        veloxBatch != nullptr,
+        "Expecting Velox columnar batch when deserializing build-side input for hash table serialization");
+    buildVectors.push_back(veloxBatch->getRowVector());
+    env->DeleteLocalRef(jBytes);
+  }
+
+  if (buildVectors.empty()) {
+    return env->NewByteArray(0);
+  }
+
+  std::vector<vector_size_t> keyChannels;
+  const jsize keyCount = env->GetArrayLength(keyOrdinals);
+  if (keyCount > 0) {
+    std::vector<jint> tmp(keyCount);
+    env->GetIntArrayRegion(keyOrdinals, 0, keyCount, tmp.data());
+    keyChannels.reserve(keyCount);
+    for (jsize i = 0; i < keyCount; ++i) {
+      keyChannels.push_back(static_cast<vector_size_t>(tmp[i]));
+    }
+  }
+
+  const std::string hashTableId = jStringToCString(env, tableId);
+  facebook::velox::RowTypePtr rowType = nullptr;
+  if (!buildVectors.empty()) {
+    rowType = asRowType(buildVectors.front()->type());
+  }
+
+  auto serialized = facebook::velox::exec::HashTableSerializer::serialize(
+      leafPool.get(),
+      rowType,
+      buildVectors,
+      keyChannels,
+      static_cast<bool>(nullAware),
+      hashTableId);
+
+  GLUTEN_CHECK(
+      serialized.payload != nullptr,
+      std::string("Velox returned an empty payload while serializing broadcast hash table ") + hashTableId);
+  serialized.payload->coalesce();
+  const auto payloadSize = serialized.payload->length();
+  const auto* payloadBytes = serialized.payload->data();
+
+  jbyteArray result = env->NewByteArray(payloadSize);
+  if (payloadSize > 0) {
+    env->SetByteArrayRegion(
+        result,
+        0,
+        payloadSize,
+        reinterpret_cast<const jbyte*>(payloadBytes));
+  }
+  return result;
+#else
+  throw GlutenException(
+      "Velox hash table serialization is unavailable. Rebuild Gluten against the specialized Velox "
+      "branch that provides hash-table serialization support.");
+#endif
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_isHashTableSerializationSupportedNative( // NOLINT
+    JNIEnv*,
+    jobject,
+    jlong) {
+  JNI_METHOD_START
+#if GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION
+  return JNI_TRUE;
+#else
+  return JNI_FALSE;
+#endif
+  JNI_METHOD_END(JNI_FALSE)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_registerSerializedNative( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong runtimeHandle,
+    jstring tableId,
+    jbyteArray payload,
+    jlong rowCount) {
+  JNI_METHOD_START
+#if GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION
+  auto runtime = jniCastOrThrow<Runtime>(runtimeHandle);
+  auto veloxRuntime = dynamic_cast<VeloxRuntime*>(runtime);
+  GLUTEN_CHECK(veloxRuntime != nullptr, "Velox runtime is required for hash table registration");
+
+  const std::string hashTableId = jStringToCString(env, tableId);
+  auto safePayload = gluten::getByteArrayElementsSafe(env, payload);
+  auto buffer = folly::IOBuf::copyBuffer(safePayload.elems(), safePayload.length());
+
+  facebook::velox::exec::HashTableSerializer::registerSerialized(
+      veloxRuntime->memoryManager()->getLeafMemoryPool().get(),
+      hashTableId,
+      std::move(buffer),
+      static_cast<uint64_t>(rowCount));
+#else
+  throw GlutenException(
+      "Velox hash table serialization is unavailable. Rebuild Gluten against the specialized Velox "
+      "branch that provides hash-table serialization support.");
+#endif
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_releaseSerializedNative( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong runtimeHandle,
+    jstring tableId) {
+  JNI_METHOD_START
+#if GLUTEN_ENABLE_VELOX_HASH_TABLE_SERIALIZATION
+  auto runtime = jniCastOrThrow<Runtime>(runtimeHandle);
+  auto veloxRuntime = dynamic_cast<VeloxRuntime*>(runtime);
+  GLUTEN_CHECK(veloxRuntime != nullptr, "Velox runtime is required for hash table release");
+
+  const std::string hashTableId = jStringToCString(env, tableId);
+  facebook::velox::exec::HashTableSerializer::releaseSerialized(hashTableId);
+#else
+  throw GlutenException(
+      "Velox hash table serialization is unavailable. Rebuild Gluten against the specialized Velox "
+      "branch that provides hash-table serialization support.");
+#endif
+  JNI_METHOD_END()
 }
 #endif
 

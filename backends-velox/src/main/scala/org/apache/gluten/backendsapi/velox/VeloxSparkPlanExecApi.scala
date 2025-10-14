@@ -20,6 +20,7 @@ import org.apache.gluten.backendsapi.SparkPlanExecApi
 import org.apache.gluten.config.{GlutenConfig, HashShuffleWriterType, ReservedKeys, RssSortShuffleWriterType, ShuffleWriterType, SortShuffleWriterType, VeloxConfig}
 import org.apache.gluten.exception.{GlutenExceptionUtil, GlutenNotSupportException}
 import org.apache.gluten.execution._
+import org.apache.gluten.execution.VeloxDriverHashTableSupport
 import org.apache.gluten.expression._
 import org.apache.gluten.expression.aggregate.{HLLAdapter, VeloxBloomFilterAggregate, VeloxCollectList, VeloxCollectSet}
 import org.apache.gluten.extension.columnar.FallbackTags
@@ -684,13 +685,20 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
-    if (useOffheapBroadcastBuildRelation) {
-      TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+    val baseRelation: BuildSideRelation =
+      if (useOffheapBroadcastBuildRelation) {
+        TaskResources.runUnsafe {
+          UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+        }
+      } else {
+        ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
       }
-    } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
-    }
+
+    VeloxDriverHashTableSupport.maybeWrapSerializedRelation(
+      child,
+      mode,
+      serialized,
+      baseRelation)
   }
 
   override def doCanonicalizeForBroadcastMode(mode: BroadcastMode): BroadcastMode = {
