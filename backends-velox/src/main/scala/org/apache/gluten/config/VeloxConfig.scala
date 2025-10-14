@@ -61,6 +61,9 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
   def enableBroadcastBuildRelationInOffheap: Boolean =
     getConf(VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP)
 
+  def broadcastHashTableSerializeOnDriver: Boolean =
+    getConf(BROADCAST_HASH_TABLE_SERIALIZE_ON_DRIVER)
+
   def veloxOrcScanEnabled: Boolean =
     getConf(VELOX_ORC_SCAN_ENABLED)
 
@@ -104,6 +107,14 @@ object VeloxConfig extends ConfigRegistry {
       .doc("The initial memory capacity to reserve for a newly created Velox query memory pool.")
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("8MB")
+
+  val BROADCAST_HASH_TABLE_SERIALIZE_ON_DRIVER =
+    buildConf("spark.gluten.velox.broadcastHashTable.serializeOnDriver")
+      .doc(
+        "Enable driver-side Velox hash-table serialization for broadcast joins when running " +
+          "against a Velox build that supports hash-table serialization.")
+      .booleanConf
+      .createWithDefault(false)
 
   val COLUMNAR_VELOX_MEM_RECLAIM_MAX_WAIT_MS =
     buildConf("spark.gluten.sql.columnar.backend.velox.reclaimMaxWaitMs")
