@@ -29,9 +29,7 @@ import org.apache.gluten.vectorized.VeloxHashTableJniWrapper
 import org.apache.spark.{broadcast, SparkContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.execution.ColumnarBuildSideRelation
 import org.apache.spark.sql.execution.joins.BuildSideRelation
-import org.apache.spark.sql.execution.unsafe.UnsafeColumnarBuildSideRelation
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.utils.SparkArrowUtil
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -48,19 +46,12 @@ case class VeloxBroadcastBuildSideRDD(
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
     val relation = broadcasted.value.asReadOnlyCopy()
-    val fromHashTable = relation match {
-      case columnar: ColumnarBuildSideRelation =>
-        deserializeHashTable(columnar.output, columnar.serializedHashTable)
-      case unsafe: UnsafeColumnarBuildSideRelation =>
-        deserializeHashTable(unsafe.output, unsafe.serializedHashTable)
-      case _ => None
-    }
-
-    fromHashTable.getOrElse {
-      Iterators
-        .wrap(relation.deserialized)
-        .recyclePayload(batch => batch.close())
-        .create()
+    relation match {
+      case hashed: VeloxBroadcastHashTableRelation =>
+        deserializeHashTable(hashed.output, Some(hashed.serializedHashTable))
+          .getOrElse(fallbackIterator(hashed.relation))
+      case other =>
+        fallbackIterator(other)
     }
   }
 
@@ -106,5 +97,12 @@ case class VeloxBroadcastBuildSideRDD(
           None
       }
     }
+  }
+
+  private def fallbackIterator(relation: BuildSideRelation): Iterator[ColumnarBatch] = {
+    Iterators
+      .wrap(relation.deserialized)
+      .recyclePayload(_.close())
+      .create()
   }
 }

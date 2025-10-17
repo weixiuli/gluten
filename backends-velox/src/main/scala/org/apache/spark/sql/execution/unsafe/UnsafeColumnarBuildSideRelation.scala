@@ -51,8 +51,7 @@ object UnsafeColumnarBuildSideRelation {
   def apply(
       output: Seq[Attribute],
       batches: UnsafeBytesBufferArray,
-      mode: BroadcastMode,
-      serializedHashTable: Option[Array[Byte]] = None): UnsafeColumnarBuildSideRelation = {
+      mode: BroadcastMode): UnsafeColumnarBuildSideRelation = {
     val boundMode = mode match {
       case HashedRelationBroadcastMode(keys, isNullAware) =>
         // Bind each key to the build-side output so simple cols become BoundReference
@@ -62,17 +61,12 @@ object UnsafeColumnarBuildSideRelation {
       case m =>
         m // IdentityBroadcastMode, etc.
     }
-    new UnsafeColumnarBuildSideRelation(
-      output,
-      batches,
-      BroadcastModeUtils.toSafe(boundMode),
-      serializedHashTable)
+    new UnsafeColumnarBuildSideRelation(output, batches, BroadcastModeUtils.toSafe(boundMode))
   }
   def apply(
       output: Seq[Attribute],
       bytesBufferArray: Array[Array[Byte]],
-      mode: BroadcastMode,
-      serializedHashTable: Option[Array[Byte]] = None): UnsafeColumnarBuildSideRelation = {
+      mode: BroadcastMode): UnsafeColumnarBuildSideRelation = {
     val boundMode = mode match {
       case HashedRelationBroadcastMode(keys, isNullAware) =>
         // Bind each key to the build-side output so simple cols become BoundReference
@@ -85,8 +79,7 @@ object UnsafeColumnarBuildSideRelation {
     new UnsafeColumnarBuildSideRelation(
       output,
       bytesBufferArray,
-      BroadcastModeUtils.toSafe(boundMode),
-      serializedHashTable
+      BroadcastModeUtils.toSafe(boundMode)
     )
   }
 }
@@ -105,8 +98,7 @@ object UnsafeColumnarBuildSideRelation {
 case class UnsafeColumnarBuildSideRelation(
     private var output: Seq[Attribute],
     private var batches: UnsafeBytesBufferArray,
-    var safeBroadcastMode: SafeBroadcastMode,
-    var serializedHashTable: Option[Array[Byte]] = None)
+    var safeBroadcastMode: SafeBroadcastMode)
   extends BuildSideRelation
   with Externalizable
   with Logging
@@ -160,14 +152,6 @@ case class UnsafeColumnarBuildSideRelation(
       val bytes = batches.getBytesBuffer(i)
       out.write(bytes)
     }
-    serializedHashTable match {
-      case Some(bytes) =>
-        out.writeBoolean(true)
-        out.writeInt(bytes.length)
-        out.write(bytes)
-      case None =>
-        out.writeBoolean(false)
-    }
   }
 
   override def write(kryo: Kryo, out: Output): Unit = Utils.tryOrIOException {
@@ -179,14 +163,6 @@ case class UnsafeColumnarBuildSideRelation(
     for (i <- 0 until batches.arraySize) {
       val bytes = batches.getBytesBuffer(i)
       out.write(bytes)
-    }
-    serializedHashTable match {
-      case Some(bytes) =>
-        out.writeBoolean(true)
-        out.writeInt(bytes.length)
-        out.write(bytes)
-      case None =>
-        out.writeBoolean(false)
     }
   }
 
@@ -212,15 +188,6 @@ case class UnsafeColumnarBuildSideRelation(
       in.readFully(tmpBuffer)
       batches.putBytesBuffer(i, tmpBuffer)
     }
-
-    serializedHashTable = if (in.readBoolean()) {
-      val length = in.readInt()
-      val tmpBuffer = new Array[Byte](length)
-      in.readFully(tmpBuffer)
-      Some(tmpBuffer)
-    } else {
-      None
-    }
   }
 
   override def read(kryo: Kryo, in: Input): Unit = Utils.tryOrIOException {
@@ -237,14 +204,6 @@ case class UnsafeColumnarBuildSideRelation(
       val tmpBuffer = new Array[Byte](length)
       in.read(tmpBuffer)
       batches.putBytesBuffer(i, tmpBuffer)
-    }
-
-    serializedHashTable = if (in.readBoolean()) {
-      val length = in.readInt()
-      val tmpBuffer = in.readBytes(length)
-      Some(tmpBuffer)
-    } else {
-      None
     }
   }
 
