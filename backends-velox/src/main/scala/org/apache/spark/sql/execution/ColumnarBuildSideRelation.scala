@@ -18,12 +18,18 @@ package org.apache.spark.sql.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.columnarbatch.ColumnarBatches
+import org.apache.gluten.config.VeloxConfig
 import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.utils.ArrowAbiUtil
-import org.apache.gluten.vectorized.{ColumnarBatchSerializerJniWrapper, NativeColumnarToRowInfo, NativeColumnarToRowJniWrapper}
+import org.apache.gluten.vectorized.{
+  ColumnarBatchSerializerJniWrapper,
+  NativeColumnarToRowInfo,
+  NativeColumnarToRowJniWrapper,
+  VeloxHashTableJniWrapper
+}
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSeq, BindReferences, BoundReference, Expression, UnsafeProjection, UnsafeRow}
@@ -44,7 +50,8 @@ object ColumnarBuildSideRelation {
   def apply(
       output: Seq[Attribute],
       batches: Array[Array[Byte]],
-      mode: BroadcastMode): ColumnarBuildSideRelation = {
+      mode: BroadcastMode,
+      serializedHashTable: Option[Array[Byte]] = None): ColumnarBuildSideRelation = {
     val boundMode = mode match {
       case HashedRelationBroadcastMode(keys, isNullAware) =>
         // Bind each key to the build-side output so simple cols become BoundReference
@@ -54,14 +61,19 @@ object ColumnarBuildSideRelation {
       case m =>
         m // IdentityBroadcastMode, etc.
     }
-    new ColumnarBuildSideRelation(output, batches, BroadcastModeUtils.toSafe(boundMode))
+    new ColumnarBuildSideRelation(
+      output,
+      batches,
+      BroadcastModeUtils.toSafe(boundMode),
+      serializedHashTable)
   }
 }
 
 case class ColumnarBuildSideRelation(
     output: Seq[Attribute],
     batches: Array[Array[Byte]],
-    safeBroadcastMode: SafeBroadcastMode)
+    safeBroadcastMode: SafeBroadcastMode,
+    serializedHashTable: Option[Array[Byte]] = None)
   extends BuildSideRelation
   with KnownSizeEstimation {
 
@@ -95,42 +107,109 @@ case class ColumnarBuildSideRelation(
   override def deserialized: Iterator[ColumnarBatch] = {
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "BuildSideRelation#deserialized")
-    val jniWrapper = ColumnarBatchSerializerJniWrapper.create(runtime)
-    val serializeHandle: Long = {
-      val allocator = ArrowBufferAllocators.contextInstance()
-      val cSchema = ArrowSchema.allocateNew(allocator)
-      val arrowSchema = SparkArrowUtil.toArrowSchema(
-        SparkShimLoader.getSparkShims.structFromAttributes(output),
-        SQLConf.get.sessionLocalTimeZone)
-      ArrowAbiUtil.exportSchema(allocator, arrowSchema, cSchema)
-      val handle = jniWrapper
-        .init(cSchema.memoryAddress())
-      cSchema.close()
-      handle
+    val allocator = ArrowBufferAllocators.contextInstance()
+    val cSchema = ArrowSchema.allocateNew(allocator)
+    val arrowSchema = SparkArrowUtil.toArrowSchema(
+      SparkShimLoader.getSparkShims.structFromAttributes(output),
+      SQLConf.get.sessionLocalTimeZone)
+    ArrowAbiUtil.exportSchema(allocator, arrowSchema, cSchema)
+
+    var cleanupHandle: () => Unit = () => ()
+    var cleaned = false
+    def runCleanup(): Unit = {
+      if (!cleaned) {
+        cleaned = true
+        cleanupHandle()
+      }
     }
 
-    Iterators
-      .wrap(new Iterator[ColumnarBatch] {
-        var batchId = 0
+    val hashTableBytes =
+      if (VeloxConfig.get.enableBroadcastHashTable) serializedHashTable else None
 
-        override def hasNext: Boolean = {
-          batchId < batches.length
+    val batchBytes =
+      try {
+        hashTableBytes match {
+          case Some(bytesFromHashTable) =>
+            val hashTableWrapper = VeloxHashTableJniWrapper.create(runtime)
+            val handle = hashTableWrapper.deserialize(bytesFromHashTable)
+            cleanupHandle = () => hashTableWrapper.close(handle)
+            val bytes =
+              try {
+                hashTableWrapper.hashTableToColumnarBatches(handle, cSchema.memoryAddress())
+              } catch {
+                case t: Throwable =>
+                  runCleanup()
+                  throw t
+              }
+            if (bytes == null) { Array.empty[Array[Byte]] } else { bytes }
+          case None =>
+            batches
         }
-
-        override def next: ColumnarBatch = {
-          val handle =
-            jniWrapper
-              .deserialize(serializeHandle, batches(batchId))
-          batchId += 1
-          ColumnarBatches.create(handle)
-        }
-      })
-      .protectInvocationFlow()
-      .recycleIterator {
-        jniWrapper.close(serializeHandle)
+      } catch {
+        case t: Throwable =>
+          runCleanup()
+          cSchema.close()
+          throw t
       }
-      .recyclePayload(ColumnarBatches.forceClose) // FIXME why force close?
-      .create()
+
+    val jniWrapper =
+      try {
+        ColumnarBatchSerializerJniWrapper.create(runtime)
+      } catch {
+        case t: Throwable =>
+          runCleanup()
+          cSchema.close()
+          throw t
+      }
+    var serializeHandle: Long = -1L
+    try {
+      serializeHandle = jniWrapper.init(cSchema.memoryAddress())
+    } catch {
+        case t: Throwable =>
+          runCleanup()
+          cSchema.close()
+          throw t
+      }
+
+    val iterator =
+      try {
+        Iterators
+          .wrap(new Iterator[ColumnarBatch] {
+            var batchId = 0
+
+            override def hasNext: Boolean = {
+              batchId < batchBytes.length
+            }
+
+            override def next: ColumnarBatch = {
+              val handle =
+                jniWrapper
+                  .deserialize(serializeHandle, batchBytes(batchId))
+              batchId += 1
+              ColumnarBatches.create(handle)
+            }
+          })
+          .protectInvocationFlow()
+          .recycleIterator {
+            runCleanup()
+            if (serializeHandle != -1L) {
+              jniWrapper.close(serializeHandle)
+            }
+            cSchema.close()
+          }
+          .recyclePayload(ColumnarBatches.forceClose)
+          .create()
+      } catch {
+        case t: Throwable =>
+          runCleanup()
+          if (serializeHandle != -1L) {
+            jniWrapper.close(serializeHandle)
+          }
+          cSchema.close()
+          throw t
+      }
+
+    iterator
   }
 
   override def asReadOnlyCopy(): ColumnarBuildSideRelation = this

@@ -586,6 +586,7 @@ To enable this feature, you can set the following Spark configuration:
 | Property                                                    | Default | Description                                                       |
 |-------------------------------------------------------------|---------|-------------------------------------------------------------------|
 | `spark.gluten.velox.offHeapBroadcastBuildRelation.enabled`  | `false` | Enable/disable off-heap storage for broadcast build relations.    |
+| `spark.gluten.velox.broadcastHashTable.enabled`              | `false` | Enable building and broadcasting serialized Velox hash tables for broadcast joins. |
 
 This feature has been tested through a series of tests, and we are collecting more feedback from users. If you have memory problem on broadcast build relations, please try this feature and give more feedbacks.
 

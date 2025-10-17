@@ -684,12 +684,19 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
+    val serializedBatches = serialized.flatMap(_.getSerialized)
+    val serializedHashTable =
+      if (VeloxConfig.get.enableBroadcastHashTable) {
+        VeloxHashTableBuilder.build(child.output, mode, serialized)
+      } else {
+        None
+      }
     if (useOffheapBroadcastBuildRelation) {
       TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+        UnsafeColumnarBuildSideRelation(child.output, serializedBatches, mode, serializedHashTable)
       }
     } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+      ColumnarBuildSideRelation(child.output, serializedBatches, mode, serializedHashTable)
     }
   }
 
