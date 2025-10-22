@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <optional>
+#include <unordered_map>
+
 #include "WholeStageResultIterator.h"
 #include "compute/Runtime.h"
 #ifdef GLUTEN_ENABLE_ENHANCED_FEATURES
@@ -66,6 +69,12 @@ class VeloxRuntime final : public Runtime {
 
   std::shared_ptr<ColumnarBatch> select(std::shared_ptr<ColumnarBatch> batch, const std::vector<int32_t>& columnIndices)
       override;
+
+  void registerBroadcastHashTable(const std::string& id, ObjectHandle handle);
+
+  void unregisterBroadcastHashTable(const std::string& id);
+
+  std::optional<ObjectHandle> getBroadcastHashTableHandle(const std::string& id) const;
 
   std::shared_ptr<RowToColumnarConverter> createRow2ColumnarConverter(struct ArrowSchema* cSchema) override;
 
@@ -123,6 +132,7 @@ class VeloxRuntime final : public Runtime {
   bool debugModeEnabled_{false};
 
   std::unordered_map<int32_t, std::shared_ptr<VeloxColumnarBatch>> emptySchemaBatchLoopUp_;
+  std::unordered_map<std::string, ObjectHandle> broadcastHashTables_;
 };
 
 } // namespace gluten

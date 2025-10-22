@@ -19,19 +19,37 @@ package org.apache.gluten.execution
 import org.apache.gluten.iterator.Iterators
 
 import org.apache.spark.{broadcast, SparkContext}
+import org.apache.spark.sql.execution.ColumnarBuildSideRelation
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 case class VeloxBroadcastBuildSideRDD(
     @transient private val sc: SparkContext,
-    broadcasted: broadcast.Broadcast[BuildSideRelation])
+    broadcasted: broadcast.Broadcast[BuildSideRelation],
+    buildHashTableId: Option[String])
   extends BroadcastBuildSideRDD(sc, broadcasted) {
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
     val relation = broadcasted.value.asReadOnlyCopy()
+    val columnarRelation = relation match {
+      case columnar: ColumnarBuildSideRelation => Some(columnar)
+      case _ => None
+    }
+    val hashTableHandle = columnarRelation.flatMap(_.getOrCreateHashTableHandle())
+    val registeredId = for {
+      id <- buildHashTableId
+      handle <- hashTableHandle
+    } yield {
+      VeloxBroadcastHashTableCache.register(id, handle)
+      id
+    }
     Iterators
       .wrap(relation.deserialized)
       .recyclePayload(batch => batch.close())
+      .recycleIterator {
+        registeredId.foreach(VeloxBroadcastHashTableCache.unregister)
+        columnarRelation.foreach(_.resetHashTableHandle())
+      }
       .create()
   }
 }

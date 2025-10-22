@@ -272,6 +272,24 @@ HashTable<ignoreNullKeys>::createFromRows(
 
 template <bool ignoreNullKeys>
 std::unique_ptr<HashTable<ignoreNullKeys>>
+HashTable<ignoreNullKeys>::createFromRowVectors(
+    const HashTableBuildInfo& info,
+    const std::vector<RowVectorPtr>& rows,
+    memory::MemoryPool* pool) {
+  auto table = createEmpty(info, pool);
+  for (const auto& rowVector : rows) {
+    if (!rowVector) {
+      continue;
+    }
+    HashTable<ignoreNullKeys>::populateContainerFromVector(*table, rowVector);
+    HashTable<ignoreNullKeys>::updateHasherStatistics(*table, rowVector);
+  }
+  table->finalizeTableBuild();
+  return table;
+}
+
+template <bool ignoreNullKeys>
+std::unique_ptr<HashTable<ignoreNullKeys>>
 HashTable<ignoreNullKeys>::createFromSerialized(
     const SerializedHashTable& serialized,
     memory::MemoryPool* pool) {

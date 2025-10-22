@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.expressions.{Expression, SortOrder}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, InnerLike, JoinType, LeftOuter, RightOuter}
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.joins.BuildSideRelation
+import org.apache.spark.sql.execution.joins.{BuildSideRelation, ColumnarBuildSideRelation}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.google.protobuf.StringValue
@@ -45,7 +45,11 @@ case class VeloxBroadcastNestedLoopJoinExecTransformer(
   override def columnarInputRDDs: Seq[RDD[ColumnarBatch]] = {
     val streamedRDD = getColumnarInputRDDs(streamedPlan)
     val broadcast = buildPlan.executeBroadcast[BuildSideRelation]()
-    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast)
+    val hashTableId = broadcast.value match {
+      case relation: ColumnarBuildSideRelation => relation.buildHashTableId
+      case _ => None
+    }
+    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast, hashTableId)
     // FIXME: Do we have to make build side a RDD?
     streamedRDD :+ broadcastRDD
   }

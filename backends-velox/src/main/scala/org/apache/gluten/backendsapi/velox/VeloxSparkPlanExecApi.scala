@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.backendsapi.velox
 
-import org.apache.gluten.backendsapi.SparkPlanExecApi
+import org.apache.gluten.backendsapi.{BackendsApiManager, SparkPlanExecApi}
 import org.apache.gluten.config.{GlutenConfig, HashShuffleWriterType, ReservedKeys, RssSortShuffleWriterType, ShuffleWriterType, SortShuffleWriterType, VeloxConfig}
 import org.apache.gluten.exception.{GlutenExceptionUtil, GlutenNotSupportException}
 import org.apache.gluten.execution._
@@ -25,7 +25,9 @@ import org.apache.gluten.expression.aggregate.{HLLAdapter, VeloxBloomFilterAggre
 import org.apache.gluten.extension.columnar.FallbackTags
 import org.apache.gluten.shuffle.NeedCustomColumnarBatchSerializer
 import org.apache.gluten.sql.shims.SparkShimLoader
-import org.apache.gluten.vectorized.{ColumnarBatchSerializer, ColumnarBatchSerializeResult}
+import org.apache.gluten.vectorized.{ColumnarBatchSerializer, ColumnarBatchSerializeResult, VeloxHashTableJniWrapper}
+import org.apache.gluten.runtime.Runtimes
+import org.apache.gluten.utils.SubstraitUtil
 
 import org.apache.spark.{ShuffleDependency, SparkEnv, SparkException}
 import org.apache.spark.api.python.{ColumnarArrowEvalPythonExec, PullOutArrowEvalPythonPreProjectHelper}
@@ -675,7 +677,8 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       .mapPartitions(itr => Iterator(BroadcastUtils.serializeStream(itr)))
       .filter(_.getNumRows != 0)
       .collect
-    val rawSize = serialized.flatMap(_.getSerialized.map(_.length.toLong)).sum
+    val serializedBatches = serialized.flatMap(_.getSerialized)
+    val rawSize = serializedBatches.map(_.length.toLong).sum
     if (rawSize >= GlutenConfig.get.maxBroadcastTableSize) {
       throw new SparkException(
         "Cannot broadcast the table that is larger than " +
@@ -684,12 +687,61 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
+    val buildHashTableId = Some(s"BuiltHashTable-${child.id}")
+    val serializedHashTable =
+      if (!useOffheapBroadcastBuildRelation) {
+        mode match {
+          case hashMode: HashedRelationBroadcastMode =>
+            val namedStruct = SubstraitUtil.toNameStruct(child.output).toByteArray
+            val numKeys = hashMode.key.length
+            val ignoreNullKeys = !hashMode.isNullAware
+            val allowDuplicates = true
+            val isJoinBuild = true
+            val hasProbedFlag = false
+            val minTableSizeForParallelJoinBuild = 0
+            val serializedRows = TaskResources.runUnsafe {
+              val runtime =
+                Runtimes.contextInstance(
+                  BackendsApiManager.getBackendName,
+                  "VeloxSparkPlanExecApi#createBroadcastRelation")
+              VeloxHashTableJniWrapper
+                .create(runtime)
+                .build(
+                  serializedBatches,
+                  namedStruct,
+                  numKeys,
+                  ignoreNullKeys,
+                  allowDuplicates,
+                  isJoinBuild,
+                  hasProbedFlag,
+                  minTableSizeForParallelJoinBuild)
+            }
+            Some(
+              VeloxSerializedHashTable(
+                namedStruct,
+                numKeys,
+                ignoreNullKeys,
+                allowDuplicates,
+                isJoinBuild,
+                hasProbedFlag,
+                minTableSizeForParallelJoinBuild,
+                serializedRows))
+          case _ => None
+        }
+      } else {
+        None
+      }
     if (useOffheapBroadcastBuildRelation) {
       TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+        UnsafeColumnarBuildSideRelation(child.output, serializedBatches, mode)
       }
     } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+      ColumnarBuildSideRelation(
+        child.output,
+        serializedBatches,
+        mode,
+        serializedHashTable,
+        serializedHashTable.flatMap(_ => buildHashTableId))
     }
   }
 

@@ -543,6 +543,11 @@ class HashTable : public BaseHashTable {
       const RowVectorPtr& rows,
       memory::MemoryPool* pool);
 
+  static std::unique_ptr<HashTable> createFromRowVectors(
+      const HashTableBuildInfo& info,
+      const std::vector<RowVectorPtr>& rows,
+      memory::MemoryPool* pool);
+
   static std::unique_ptr<HashTable> createFromSerialized(
       const SerializedHashTable& serialized,
       memory::MemoryPool* pool);

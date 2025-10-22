@@ -212,6 +212,22 @@ std::shared_ptr<ColumnarBatch> VeloxRuntime::select(
   return outputBatch;
 }
 
+void VeloxRuntime::registerBroadcastHashTable(const std::string& id, ObjectHandle handle) {
+  broadcastHashTables_[id] = handle;
+}
+
+void VeloxRuntime::unregisterBroadcastHashTable(const std::string& id) {
+  broadcastHashTables_.erase(id);
+}
+
+std::optional<ObjectHandle> VeloxRuntime::getBroadcastHashTableHandle(const std::string& id) const {
+  auto it = broadcastHashTables_.find(id);
+  if (it == broadcastHashTables_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
 std::shared_ptr<RowToColumnarConverter> VeloxRuntime::createRow2ColumnarConverter(struct ArrowSchema* cSchema) {
   auto veloxPool = memoryManager()->getLeafMemoryPool();
   return std::make_shared<VeloxRowToColumnarConverter>(cSchema, veloxPool);
