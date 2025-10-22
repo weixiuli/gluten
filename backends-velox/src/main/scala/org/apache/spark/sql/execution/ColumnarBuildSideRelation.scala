@@ -18,6 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.columnarbatch.ColumnarBatches
+import org.apache.gluten.execution.VeloxSerializedHashTable
 import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators
 import org.apache.gluten.runtime.Runtimes
@@ -44,7 +45,9 @@ object ColumnarBuildSideRelation {
   def apply(
       output: Seq[Attribute],
       batches: Array[Array[Byte]],
-      mode: BroadcastMode): ColumnarBuildSideRelation = {
+      mode: BroadcastMode,
+      serializedHashTable: Option[VeloxSerializedHashTable] = None,
+      buildHashTableId: Option[String] = None): ColumnarBuildSideRelation = {
     val boundMode = mode match {
       case HashedRelationBroadcastMode(keys, isNullAware) =>
         // Bind each key to the build-side output so simple cols become BoundReference
@@ -54,14 +57,21 @@ object ColumnarBuildSideRelation {
       case m =>
         m // IdentityBroadcastMode, etc.
     }
-    new ColumnarBuildSideRelation(output, batches, BroadcastModeUtils.toSafe(boundMode))
+    new ColumnarBuildSideRelation(
+      output,
+      batches,
+      BroadcastModeUtils.toSafe(boundMode),
+      serializedHashTable,
+      buildHashTableId)
   }
 }
 
 case class ColumnarBuildSideRelation(
     output: Seq[Attribute],
     batches: Array[Array[Byte]],
-    safeBroadcastMode: SafeBroadcastMode)
+    safeBroadcastMode: SafeBroadcastMode,
+    serializedHashTable: Option[VeloxSerializedHashTable] = None,
+    buildHashTableId: Option[String] = None)
   extends BuildSideRelation
   with KnownSizeEstimation {
 
@@ -75,6 +85,8 @@ case class ColumnarBuildSideRelation(
       Some(BroadcastModeUtils.deserializeExpressions(bytes))
     case _ => None
   }
+
+  @transient private var hashTableHandle: Long = 0L
 
   private def transformProjection: UnsafeProjection = safeBroadcastMode match {
     case IdentitySafeBroadcastMode =>
@@ -134,6 +146,22 @@ case class ColumnarBuildSideRelation(
   }
 
   override def asReadOnlyCopy(): ColumnarBuildSideRelation = this
+
+  def getOrCreateHashTableHandle(): Option[Long] = synchronized {
+    serializedHashTable.map { table =>
+      if (hashTableHandle == 0L) {
+        hashTableHandle = table.deserializeHandle()
+      }
+      hashTableHandle
+    }
+  }
+
+  def resetHashTableHandle(): Unit = synchronized {
+    if (hashTableHandle != 0L) {
+      serializedHashTable.foreach(_.closeHandle(hashTableHandle))
+      hashTableHandle = 0L
+    }
+  }
 
   /**
    * Transform columnar broadcast value to Array[InternalRow] by key.

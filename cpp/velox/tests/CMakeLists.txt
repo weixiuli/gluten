@@ -50,7 +50,8 @@ add_velox_test(
   VeloxRowToColumnarTest.cc
   VeloxColumnarBatchSerializerTest.cc
   VeloxColumnarBatchTest.cc
-  VeloxBatchResizerTest.cc)
+  VeloxBatchResizerTest.cc
+  VeloxHashTableSerializationTest.cc)
 add_velox_test(
   velox_plan_conversion_test
   SOURCES

@@ -21,7 +21,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.BuildSide
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.joins.BuildSideRelation
+import org.apache.spark.sql.execution.joins.{BuildSideRelation, ColumnarBuildSideRelation}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import io.substrait.proto.JoinRel
@@ -126,7 +126,11 @@ case class BroadcastHashJoinExecTransformer(
   override def columnarInputRDDs: Seq[RDD[ColumnarBatch]] = {
     val streamedRDD = getColumnarInputRDDs(streamedPlan)
     val broadcast = buildPlan.executeBroadcast[BuildSideRelation]()
-    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast)
+    val hashTableId = broadcast.value match {
+      case relation: ColumnarBuildSideRelation => relation.buildHashTableId
+      case _ => None
+    }
+    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast, hashTableId)
     // FIXME: Do we have to make build side a RDD?
     streamedRDD :+ broadcastRDD
   }
