@@ -79,4 +79,5 @@ nav_order: 16
 | spark.gluten.velox.abandonbuild.noduphashminpct          | 0.0     | Experimental: abandon hashmap build if duplicated rows are more than this percentile.                                                   |
 | spark.gluten.velox.abandonbuild.noduphashminrows         | 100000  | Experimental: abandon hashmap build if duplicated rows more than this number.                                                           |
 | spark.gluten.velox.offHeapBroadcastBuildRelation.enabled | false   | Experimental: If enabled, broadcast build relation will use offheap memory. Otherwise, broadcast build relation will use onheap memory. |
+| spark.gluten.velox.broadcastHashTable.enabled            | false   | Experimental: If enabled, the driver builds and broadcasts a serialized Velox hash table alongside columnar broadcast batches so executors can lazily materialize them. |
 
