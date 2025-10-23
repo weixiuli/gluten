@@ -16,11 +16,26 @@
  */
 package org.apache.gluten.execution
 
+import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.config.VeloxConfig
 import org.apache.gluten.iterator.Iterators
+import org.apache.gluten.runtime.Runtimes
+import org.apache.gluten.vectorized.VeloxHashTableJniWrapper
 
-import org.apache.spark.{broadcast, SparkContext}
+import org.apache.spark.{TaskContext, broadcast, SparkContext}
+import org.apache.spark.sql.execution.VeloxHashTableBuildSideRelation
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
+
+class VeloxBroadcastBuildSideIterator(
+    iter: Iterator[ColumnarBatch],
+    val buildHashTableId: Option[String])
+  extends Iterator[ColumnarBatch] {
+
+  override def hasNext: Boolean = iter.hasNext
+
+  override def next(): ColumnarBatch = iter.next()
+}
 
 case class VeloxBroadcastBuildSideRDD(
     @transient private val sc: SparkContext,
@@ -29,9 +44,28 @@ case class VeloxBroadcastBuildSideRDD(
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
     val relation = broadcasted.value.asReadOnlyCopy()
-    Iterators
-      .wrap(relation.deserialized)
-      .recyclePayload(batch => batch.close())
-      .create()
+    val baseIterator =
+      Iterators
+        .wrap(relation.deserialized)
+        .recyclePayload(batch => batch.close())
+        .create()
+    val prebuiltEnabled = VeloxConfig.get.enableVeloxPrebuiltHashTables
+    relation match {
+      case hashRelation: VeloxHashTableBuildSideRelation if prebuiltEnabled =>
+        val runtime =
+          Runtimes.contextInstance(
+            BackendsApiManager.getBackendName,
+            "VeloxBroadcastBuildSideRDD#genBroadcastBuildSideIterator")
+        val jniWrapper = VeloxHashTableJniWrapper.create(runtime)
+        jniWrapper.registerSerialized(hashRelation.buildHashTableId, hashRelation.serializedHashTable)
+        Option(TaskContext.get()).foreach { tc =>
+          tc.addTaskCompletionListener[Unit](_ => jniWrapper.drop(hashRelation.buildHashTableId))
+        }
+        new VeloxBroadcastBuildSideIterator(baseIterator, Some(hashRelation.buildHashTableId))
+      case _: VeloxHashTableBuildSideRelation =>
+        new VeloxBroadcastBuildSideIterator(baseIterator, None)
+      case _ =>
+        new VeloxBroadcastBuildSideIterator(baseIterator, None)
+    }
   }
 }

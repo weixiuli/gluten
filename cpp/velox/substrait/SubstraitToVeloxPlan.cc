@@ -19,6 +19,7 @@
 
 #include "TypeUtils.h"
 #include "VariantToVectorConverter.h"
+#include "exec/PrebuiltHashTable.h"
 #include "operators/plannodes/RowVectorStream.h"
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/exec/TableWriter.h"
@@ -263,6 +264,14 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   auto leftNode = toVeloxPlan(sJoin.left());
   auto rightNode = toVeloxPlan(sJoin.right());
 
+  std::optional<std::string> preloadedHashTableId;
+  if (sJoin.has_advanced_extension()) {
+    auto id = SubstraitParser::configValueInOptimization(sJoin.advanced_extension(), "buildHashTableId=");
+    if (id.has_value() && !id->empty()) {
+      preloadedHashTableId = id;
+    }
+  }
+
   // Map join type.
   core::JoinType joinType;
   bool isNullAwareAntiJoin = false;
@@ -330,6 +339,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     filter = exprConverter_->toVeloxExpr(sJoin.post_join_filter(), inputRowType);
   }
 
+  auto outputType = getJoinOutputType(leftNode, rightNode, joinType);
+
   if (sJoin.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isSMJ=")) {
     // Create MergeJoinNode node
@@ -341,20 +352,33 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
         filter,
         leftNode,
         rightNode,
-        getJoinOutputType(leftNode, rightNode, joinType));
+        outputType);
 
   } else {
-    // Create HashJoinNode node
-    return std::make_shared<core::HashJoinNode>(
+    auto hashJoinNode = std::make_shared<core::HashJoinNode>(
         nextPlanNodeId(),
         joinType,
         isNullAwareAntiJoin,
-        leftKeys,
-        rightKeys,
+        std::move(leftKeys),
+        std::move(rightKeys),
         filter,
         leftNode,
         rightNode,
-        getJoinOutputType(leftNode, rightNode, joinType));
+        outputType);
+
+    if (preloadedHashTableId.has_value()) {
+      auto table = VeloxPrebuiltHashTables::get(preloadedHashTableId.value());
+      GLUTEN_CHECK(
+          table != nullptr,
+          "Missing prebuilt Velox hash table '{}' for broadcast hash join build side.",
+          preloadedHashTableId.value());
+
+      std::shared_ptr<const core::HashJoinNode> constHashJoinNode = hashJoinNode;
+      VeloxPrebuiltHashTables::attachPrebuiltHashTable(
+          constHashJoinNode, preloadedHashTableId.value(), std::move(table));
+    }
+
+    return hashJoinNode;
   }
 }
 

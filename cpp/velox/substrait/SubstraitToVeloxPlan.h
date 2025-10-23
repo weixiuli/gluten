@@ -24,6 +24,8 @@
 #include "velox/core/PlanNode.h"
 #include "velox/dwio/common/Options.h"
 
+#include <optional>
+
 namespace gluten {
 class ResultIterator;
 

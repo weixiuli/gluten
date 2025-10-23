@@ -28,16 +28,20 @@
 #include "compute/VeloxBackend.h"
 #include "compute/VeloxRuntime.h"
 #include "config/GlutenConfig.h"
+#include "exec/HashTableBuilder.h"
+#include "exec/PrebuiltHashTable.h"
 #include "jni/JniError.h"
 #include "jni/JniFileSystem.h"
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
 #include "shuffle/rss/RssPartitionWriter.h"
 #include "substrait/SubstraitToVeloxPlanValidator.h"
+#include "substrait/SubstraitParser.h"
 #include "utils/ObjectStore.h"
 #include "utils/VeloxBatchResizer.h"
 #include "velox/common/base/BloomFilter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/core/PlanNode.h"
 
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/CudfPlanValidator.h"
@@ -56,6 +60,32 @@ jmethodID infoClsInitMethod;
 
 jclass blockStripesClass;
 jmethodID blockStripesConstructor;
+
+facebook::velox::core::JoinType parseJoinType(jint ordinal) {
+  using facebook::velox::core::JoinType;
+  switch (ordinal) {
+    case 0:
+      return JoinType::kInner;
+    case 1:
+      return JoinType::kLeft;
+    case 2:
+      return JoinType::kRight;
+    case 3:
+      return JoinType::kFull;
+    case 4:
+      return JoinType::kLeftSemiProject;
+    case 5:
+      return JoinType::kLeftSemiFilter;
+    case 6:
+      return JoinType::kRightSemiProject;
+    case 7:
+      return JoinType::kRightSemiFilter;
+    case 8:
+      return JoinType::kAnti;
+    default:
+      VELOX_FAIL("Unsupported join type ordinal {}", ordinal);
+  }
+}
 } // namespace
 
 #ifdef __cplusplus
@@ -812,6 +842,109 @@ JNIEXPORT jobjectArray JNICALL Java_org_apache_gluten_execution_IcebergWriteJniW
   JNI_METHOD_END(nullptr)
 }
 #endif
+
+JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_build( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlongArray batchHandles,
+    jintArray keyChannelsArray,
+    jint joinTypeOrdinal,
+    jboolean nullAware,
+    jboolean hasFilter,
+    jint minTableSize,
+    jbyteArray schemaBytes) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  VELOX_CHECK_NOT_NULL(runtime, "Expected VeloxRuntime");
+  auto pool = runtime->memoryManager()->getLeafMemoryPool().get();
+
+  const auto numBatches = env->GetArrayLength(batchHandles);
+  std::vector<jlong> handles(numBatches);
+  env->GetLongArrayRegion(batchHandles, 0, numBatches, handles.data());
+
+  std::vector<std::shared_ptr<VeloxColumnarBatch>> batches;
+  batches.reserve(numBatches);
+  std::vector<facebook::velox::RowVectorPtr> rowVectors;
+  rowVectors.reserve(numBatches);
+  for (auto handle : handles) {
+    auto batch = ObjectStore::retrieve<ColumnarBatch>(handle);
+    VELOX_CHECK(batch != nullptr, "Invalid columnar batch handle {}", handle);
+    auto veloxBatch = VeloxColumnarBatch::from(pool, batch);
+    batches.emplace_back(veloxBatch);
+    rowVectors.emplace_back(veloxBatch->getRowVector());
+  }
+
+  const auto numKeys = env->GetArrayLength(keyChannelsArray);
+  std::vector<int32_t> keyChannels(numKeys);
+  env->GetIntArrayRegion(keyChannelsArray, 0, numKeys, keyChannels.data());
+
+  auto schemaSafe = getByteArrayElementsSafe(env, schemaBytes);
+  ::substrait::NamedStruct namedStruct;
+  namedStruct.ParseFromArray(schemaSafe.elems(), schemaSafe.length());
+  std::vector<facebook::velox::TypePtr> types = SubstraitParser::parseNamedStruct(namedStruct);
+  std::vector<std::string> names;
+  names.reserve(namedStruct.names_size());
+  for (const auto& name : namedStruct.names()) {
+    names.emplace_back(name);
+  }
+  VELOX_CHECK_EQ(
+      names.size(),
+      types.size(),
+      "Mismatch between struct names ({}) and types ({}) when building hash table",
+      names.size(),
+      types.size());
+  auto inputType = facebook::velox::ROW(std::move(names), std::move(types));
+
+  facebook::velox::exec::HashTableBuilder builder(
+      pool,
+      inputType,
+      std::move(keyChannels),
+      parseJoinType(joinTypeOrdinal),
+      nullAware,
+      hasFilter,
+      static_cast<uint32_t>(minTableSize));
+
+  for (const auto& rowVector : rowVectors) {
+    builder.addInput(rowVector);
+  }
+
+  auto table = builder.build();
+  auto serialized = table->serialize();
+
+  jbyteArray result = env->NewByteArray(serialized.size());
+  env->SetByteArrayRegion(
+      result, 0, serialized.size(), reinterpret_cast<const jbyte*>(serialized.data()));
+  return result;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_registerSerialized( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jstring id,
+    jbyteArray serializedArray) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  VELOX_CHECK_NOT_NULL(runtime, "Expected VeloxRuntime");
+  auto pool = runtime->memoryManager()->getLeafMemoryPool().get();
+
+  auto safeBytes = getByteArrayElementsSafe(env, serializedArray);
+  std::string serialized(
+      reinterpret_cast<const char*>(safeBytes.elems()), safeBytes.length());
+  VeloxPrebuiltHashTables::registerSerialized(jStringToCString(env, id), serialized, pool);
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_drop( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jstring id) {
+  JNI_METHOD_START
+  VeloxPrebuiltHashTables::erase(jStringToCString(env, id));
+  JNI_METHOD_END()
+}
 
 #ifdef __cplusplus
 }

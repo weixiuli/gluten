@@ -19,6 +19,8 @@
 #include "TypeUtils.h"
 #include "velox/common/base/Exceptions.h"
 
+#include <optional>
+
 #include "VeloxSubstraitSignature.h"
 
 namespace gluten {
@@ -287,6 +289,30 @@ bool SubstraitParser::configSetInOptimization(
     }
   }
   return false;
+}
+
+std::optional<std::string> SubstraitParser::configValueInOptimization(
+    const ::substrait::extensions::AdvancedExtension& extension,
+    const std::string& key) {
+  if (!extension.has_optimization()) {
+    return std::nullopt;
+  }
+  google::protobuf::StringValue msg;
+  extension.optimization().UnpackTo(&msg);
+  const auto& value = msg.value();
+  std::size_t pos = value.find(key);
+  if (pos == std::string::npos) {
+    return std::nullopt;
+  }
+  pos += key.size();
+  if (pos > value.size()) {
+    return std::string();
+  }
+  auto end = value.find('\n', pos);
+  if (end == std::string::npos) {
+    end = value.size();
+  }
+  return value.substr(pos, end - pos);
 }
 
 std::vector<TypePtr> SubstraitParser::sigToTypes(const std::string& signature) {

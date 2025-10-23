@@ -14,25 +14,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.gluten.vectorized;
 
-#pragma once
+import org.apache.spark.sql.vectorized.ColumnarBatch;
 
-#include "ColumnarBatch.h"
+import java.util.Iterator;
 
-namespace gluten {
+public class VeloxHashTableColumnarBatchInIterator extends ColumnarBatchInIterator {
+  private final String buildHashTableId;
 
-class ColumnarBatchIterator {
- public:
-  ColumnarBatchIterator() {}
-
-  virtual ~ColumnarBatchIterator() = default;
-
-  // null means stream end
-  virtual std::shared_ptr<ColumnarBatch> next() = 0;
-
-  virtual int64_t spillFixedSize(int64_t size) {
-    return 0L;
+  public VeloxHashTableColumnarBatchInIterator(
+      String backendName, Iterator<ColumnarBatch> delegated, String buildHashTableId) {
+    super(backendName, delegated);
+    this.buildHashTableId = buildHashTableId;
   }
 
-};
-} // namespace gluten
+  @Override
+  public String getBuildHashTableId() {
+    return buildHashTableId;
+  }
+}

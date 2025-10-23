@@ -82,6 +82,8 @@ trait BackendSettingsApi {
 
   def enableJoinKeysRewrite(): Boolean = true
 
+  def enablePrebuiltHashTables(): Boolean = false
+
   def supportHashBuildJoinTypeOnLeft: JoinType => Boolean = {
     case _: InnerLike | RightOuter | FullOuter => true
     case _ => false
