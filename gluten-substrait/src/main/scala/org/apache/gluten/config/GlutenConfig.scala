@@ -112,6 +112,11 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
 
   def enableColumnarBroadcastJoin: Boolean = getConf(COLUMNAR_BROADCAST_JOIN_ENABLED)
 
+  def enableBroadcastHashTable: Boolean = getConf(COLUMNAR_BROADCAST_HASH_TABLE_ENABLED)
+
+  def enableBroadcastHashTableCache: Boolean =
+    enableBroadcastHashTable && getConf(COLUMNAR_BROADCAST_HASH_TABLE_CACHE_ENABLED)
+
   def enableColumnarSample: Boolean = getConf(COLUMNAR_SAMPLE_ENABLED)
 
   def enableColumnarArrowUDF: Boolean = getConf(COLUMNAR_ARROW_UDF_ENABLED)
@@ -932,6 +937,25 @@ object GlutenConfig extends ConfigRegistry {
       .doc("Enable or disable columnar broadcastJoin.")
       .booleanConf
       .createWithDefault(true)
+
+  val COLUMNAR_BROADCAST_HASH_TABLE_ENABLED =
+    buildConf("spark.gluten.sql.columnar.broadcast.hashTable.enabled")
+      .experimental()
+      .doc(
+        "Experimental: Master switch for broadcast hash table features across Gluten backends. " +
+          "If disabled, broadcast hash table integrations remain inactive regardless of downstream feature flags.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val COLUMNAR_BROADCAST_HASH_TABLE_CACHE_ENABLED =
+    buildConf("spark.gluten.sql.columnar.broadcast.hashTableCache.enabled")
+      .experimental()
+      .doc(
+        "Experimental: Enable caching of serialized broadcast hash tables for reuse across Gluten backends. " +
+          "Requires spark.gluten.sql.columnar.broadcast.hashTable.enabled to also be true. " +
+          "If disabled, broadcast hash table caching remains inactive regardless of backend-specific toggles.")
+      .booleanConf
+      .createWithDefault(false)
 
   val COLUMNAR_ARROW_UDF_ENABLED =
     buildConf("spark.gluten.sql.columnar.arrowUdf")

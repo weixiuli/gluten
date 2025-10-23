@@ -289,6 +289,27 @@ bool SubstraitParser::configSetInOptimization(
   return false;
 }
 
+std::optional<std::string> SubstraitParser::findConfigValueInOptimization(
+    const ::substrait::extensions::AdvancedExtension& extension,
+    const std::string& key) {
+  if (!extension.has_optimization()) {
+    return std::nullopt;
+  }
+  google::protobuf::StringValue msg;
+  extension.optimization().UnpackTo(&msg);
+  const auto& value = msg.value();
+  auto pos = value.find(key);
+  if (pos == std::string::npos) {
+    return std::nullopt;
+  }
+  pos += key.size();
+  auto end = value.find('\n', pos);
+  if (end == std::string::npos) {
+    end = value.size();
+  }
+  return value.substr(pos, end - pos);
+}
+
 std::vector<TypePtr> SubstraitParser::sigToTypes(const std::string& signature) {
   std::vector<std::string> typeStrs = SubstraitParser::getSubFunctionTypes(signature);
   std::vector<TypePtr> types;
