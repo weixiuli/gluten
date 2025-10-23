@@ -21,6 +21,8 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
 
+#include <thread>
+
 namespace facebook::velox::exec {
 
 using PartitionBoundIndexType = int64_t;
@@ -312,6 +314,12 @@ class BaseHashTable {
   /// side. This is used for sizing the internal hash table.
   virtual uint64_t numDistinct() const = 0;
 
+  virtual bool reused() const = 0;
+
+  virtual bool joinHasNullKeys() const = 0;
+
+  virtual void setJoinHasNullKeys() = 0;
+
   /// Return a number of current stats that can help with debugging and
   /// profiling.
   virtual HashTableStats stats() const = 0;
@@ -483,9 +491,8 @@ class HashTable : public BaseHashTable {
       bool isJoinBuild,
       bool hasProbedFlag,
       uint32_t minTableSizeForParallelJoinBuild,
-      memory::MemoryPool* pool);
-
-  ~HashTable() override = default;
+      memory::MemoryPool* pool,
+      bool reused = false);
 
   static std::unique_ptr<HashTable> createForAggregation(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -508,7 +515,8 @@ class HashTable : public BaseHashTable {
       bool allowDuplicates,
       bool hasProbedFlag,
       uint32_t minTableSizeForParallelJoinBuild,
-      memory::MemoryPool* pool) {
+      memory::MemoryPool* pool,
+      bool reused = false) {
     return std::make_unique<HashTable>(
         std::move(hashers),
         std::vector<Accumulator>{},
@@ -517,7 +525,8 @@ class HashTable : public BaseHashTable {
         true, // isJoinBuild
         hasProbedFlag,
         minTableSizeForParallelJoinBuild,
-        pool);
+        pool,
+        reused);
   }
 
   void groupProbe(HashLookup& lookup, int8_t spillInputStartPartitionBit)
@@ -574,6 +583,18 @@ class HashTable : public BaseHashTable {
 
   uint64_t numDistinct() const override {
     return numDistinct_;
+  }
+
+  bool reused() const override {
+    return reused_;
+  }
+
+  bool joinHasNullKeys() const override {
+    return joinHasNullKeys_;
+  }
+
+  void setJoinHasNullKeys() override {
+    joinHasNullKeys_ = true;
   }
 
   HashTableStats stats() const override {
@@ -1131,6 +1152,16 @@ class HashTable : public BaseHashTable {
 
   friend class ProbeState;
   friend test::HashTableTestHelper<ignoreNullKeys>;
+
+  std::mutex mutex_;
+
+  bool prepared_{false};
+
+  bool reused_{false};
+
+  // True if this is a build side of an anti or left semi project join and has
+  // at least one entry with null join keys.
+  bool joinHasNullKeys_{false};
 };
 
 } // namespace facebook::velox::exec
