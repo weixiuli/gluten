@@ -30,6 +30,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.{ExpandOutputPartitioningShim, ExplainUtils, SparkPlan}
 import org.apache.spark.sql.execution.joins.{BaseJoinExec, HashedRelationBroadcastMode, HashJoin}
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -342,6 +343,39 @@ abstract class ShuffledHashJoinExecTransformerBase(
   }
 }
 
+object BroadcastHashJoinExecTransformerBase {
+  case class BuildSideMeta(buildHashTableId: String, joinType: JoinType, hasFilter: Boolean)
+
+  private val BuildSideMetaTag: TreeNodeTag[BuildSideMeta] =
+    TreeNodeTag[BuildSideMeta]("org.apache.gluten.BroadcastHashJoinExecTransformerBase.BuildSideMeta")
+
+  private def attachMeta(plan: SparkPlan, meta: BuildSideMeta): Unit = {
+    def loop(node: SparkPlan): Unit = {
+      node.setTagValue(BuildSideMetaTag, meta)
+      node.children.foreach(loop)
+    }
+    loop(plan)
+  }
+
+  def registerBuildSideMeta(plan: SparkPlan, meta: BuildSideMeta): Unit = {
+    attachMeta(plan, meta)
+  }
+
+  def getBuildSideMeta(plan: SparkPlan): Option[BuildSideMeta] = plan.getTagValue(BuildSideMetaTag)
+
+  def toVeloxJoinTypeOrdinal(joinType: JoinType): Int = joinType match {
+    case _: InnerLike => 0
+    case LeftOuter => 1
+    case RightOuter => 2
+    case FullOuter => 3
+    case LeftSemi => 4
+    case ExistenceJoin(_) => 4
+    case RightSemi => 6
+    case LeftAnti => 8
+    case _ => 0
+  }
+}
+
 abstract class BroadcastHashJoinExecTransformerBase(
     leftKeys: Seq[Expression],
     rightKeys: Seq[Expression],
@@ -369,10 +403,23 @@ abstract class BroadcastHashJoinExecTransformerBase(
   override def joinBuildSide: BuildSide = buildSide
   override def hashJoinType: JoinType = joinType
 
+  lazy val buildSideMeta: BroadcastHashJoinExecTransformerBase.BuildSideMeta = {
+    val meta = BroadcastHashJoinExecTransformerBase.BuildSideMeta(
+      s"BuiltHashTable-${buildPlan.id}",
+      joinType,
+      condition.isDefined)
+    if (BackendsApiManager.getSettings.enablePrebuiltHashTables()) {
+      BroadcastHashJoinExecTransformerBase.registerBuildSideMeta(buildPlan, meta)
+    }
+    meta
+  }
+
   // Unique ID for builded hash table
-  lazy val buildHashTableId: String = "BuiltHashTable-" + buildPlan.id
+  lazy val buildHashTableId: String = buildSideMeta.buildHashTableId
 
   override def genJoinParametersInternal(): (Int, Int, String) = {
-    (1, if (isNullAwareAntiJoin) 1 else 0, buildHashTableId)
+    val hashTableId =
+      if (BackendsApiManager.getSettings.enablePrebuiltHashTables()) buildHashTableId else ""
+    (1, if (isNullAwareAntiJoin) 1 else 0, hashTableId)
   }
 }

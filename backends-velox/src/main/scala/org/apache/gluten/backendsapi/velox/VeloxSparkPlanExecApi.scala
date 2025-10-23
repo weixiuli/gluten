@@ -16,16 +16,21 @@
  */
 package org.apache.gluten.backendsapi.velox
 
-import org.apache.gluten.backendsapi.SparkPlanExecApi
+import org.apache.gluten.backendsapi.{BackendsApiManager, SparkPlanExecApi}
 import org.apache.gluten.config.{GlutenConfig, HashShuffleWriterType, ReservedKeys, RssSortShuffleWriterType, ShuffleWriterType, SortShuffleWriterType, VeloxConfig}
 import org.apache.gluten.exception.{GlutenExceptionUtil, GlutenNotSupportException}
 import org.apache.gluten.execution._
 import org.apache.gluten.expression._
 import org.apache.gluten.expression.aggregate.{HLLAdapter, VeloxBloomFilterAggregate, VeloxCollectList, VeloxCollectSet}
 import org.apache.gluten.extension.columnar.FallbackTags
+import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators
 import org.apache.gluten.shuffle.NeedCustomColumnarBatchSerializer
 import org.apache.gluten.sql.shims.SparkShimLoader
-import org.apache.gluten.vectorized.{ColumnarBatchSerializer, ColumnarBatchSerializeResult}
+import org.apache.gluten.utils.{ArrowAbiUtil, SubstraitUtil}
+import org.apache.gluten.vectorized.{ColumnarBatchSerializer, ColumnarBatchSerializeResult, ColumnarBatchSerializerJniWrapper,
+ VeloxHashTableJniWrapper}
+import org.apache.gluten.columnarbatch.ColumnarBatches
+import org.apache.gluten.runtime.Runtimes
 
 import org.apache.spark.{ShuffleDependency, SparkEnv, SparkException}
 import org.apache.spark.api.python.{ColumnarArrowEvalPythonExec, PullOutArrowEvalPythonPreProjectHelper}
@@ -54,6 +59,7 @@ import org.apache.spark.sql.expression.{UDFExpression, UserDefinedAggregateFunct
 import org.apache.spark.sql.hive.VeloxHiveUDFTransformer
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.utils.SparkArrowUtil
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.task.TaskResources
 
@@ -62,6 +68,10 @@ import org.apache.commons.lang3.ClassUtils
 import javax.ws.rs.core.UriBuilder
 
 import java.util.Locale
+
+import org.apache.arrow.c.ArrowSchema
+
+import scala.collection.JavaConverters._
 
 class VeloxSparkPlanExecApi extends SparkPlanExecApi {
 
@@ -684,12 +694,105 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
-    if (useOffheapBroadcastBuildRelation) {
-      TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+    val flattenedBatches = serialized.flatMap(_.getSerialized)
+    val baseRelation =
+      if (useOffheapBroadcastBuildRelation) {
+        TaskResources.runUnsafe {
+          UnsafeColumnarBuildSideRelation(child.output, flattenedBatches, mode)
+        }
+      } else {
+        ColumnarBuildSideRelation(child.output, flattenedBatches, mode)
       }
-    } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+
+    val prebuiltEnabled = VeloxConfig.get.enableVeloxPrebuiltHashTables
+
+    val maybePrebuilt =
+      if (!prebuiltEnabled || flattenedBatches.isEmpty) {
+        None
+      } else {
+        (mode, BroadcastHashJoinExecTransformerBase.getBuildSideMeta(child)) match {
+          case (hashMode: HashedRelationBroadcastMode, Some(meta)) =>
+            val ordinals = hashMode.key.collect { case BoundReference(ord, _, _) => ord }
+            if (ordinals.length == hashMode.key.length && ordinals.nonEmpty) {
+              buildVeloxHashTable(
+                flattenedBatches,
+                child.output,
+                ordinals.toArray,
+                BroadcastHashJoinExecTransformerBase.toVeloxJoinTypeOrdinal(meta.joinType),
+                hashMode.isNullAware,
+                meta.hasFilter
+              ).map(bytes => (meta.buildHashTableId, bytes))
+            } else {
+              None
+            }
+          case _ => None
+        }
+      }
+
+    maybePrebuilt match {
+      case Some((hashTableId, serializedHashTable)) =>
+        VeloxHashTableBuildSideRelation(baseRelation, hashTableId, serializedHashTable)
+      case None => baseRelation
+    }
+  }
+
+  private def buildVeloxHashTable(
+      serializedBatches: Array[Array[Byte]],
+      output: Seq[Attribute],
+      keyOrdinals: Array[Int],
+      joinTypeOrdinal: Int,
+      nullAware: Boolean,
+      hasFilter: Boolean): Option[Array[Byte]] = {
+    if (serializedBatches.isEmpty) {
+      return None
+    }
+
+    val runtime =
+      Runtimes.contextInstance(BackendsApiManager.getBackendName, "VeloxSparkPlanExecApi#buildHashTable")
+    val serializer = ColumnarBatchSerializerJniWrapper.create(runtime)
+
+    val allocator = ArrowBufferAllocators.contextInstance()
+    val cSchema = ArrowSchema.allocateNew(allocator)
+    val arrowSchema = SparkArrowUtil.toArrowSchema(
+      SparkShimLoader.getSparkShims.structFromAttributes(output),
+      SQLConf.get.sessionLocalTimeZone)
+    ArrowAbiUtil.exportSchema(allocator, arrowSchema, cSchema)
+    val serializerHandle = serializer.init(cSchema.memoryAddress())
+    cSchema.close()
+
+    val batches = scala.collection.mutable.ArrayBuffer.empty[ColumnarBatch]
+    try {
+      serializedBatches.foreach { bytes =>
+        val handle = serializer.deserialize(serializerHandle, bytes)
+        val batch = ColumnarBatches.create(handle)
+        batches += batch
+      }
+
+      if (batches.isEmpty) {
+        None
+      } else {
+        val batchHandles = batches
+          .map(batch => ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch))
+          .toArray
+        val schemaBytes = SubstraitUtil.toNameStruct(output.asJava).toByteArray
+        val minParallelSize =
+          SparkEnv.get.conf.getInt(
+            "spark.gluten.sql.columnar.backend.velox.minTableSizeForParallelJoinBuild",
+            0)
+        val jniWrapper = VeloxHashTableJniWrapper.create(runtime)
+        Option(
+          jniWrapper.build(
+            batchHandles,
+            keyOrdinals,
+            joinTypeOrdinal,
+            nullAware,
+            hasFilter,
+            minParallelSize,
+            schemaBytes))
+      }
+    } finally {
+      batches.foreach(ColumnarBatches.release)
+      serializer.close(serializerHandle)
     }
   }
 

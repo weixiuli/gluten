@@ -154,6 +154,7 @@ set(VELOX_SRCS
     compute/VeloxPlanConverter.cc
     compute/WholeStageResultIterator.cc
     compute/iceberg/IcebergPlanConverter.cc
+    exec/PrebuiltHashTable.cpp
     jni/JniFileSystem.cc
     jni/JniUdf.cc
     jni/VeloxJniWrapper.cc

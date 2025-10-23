@@ -49,6 +49,17 @@ import scala.collection.JavaConverters._
 
 class VeloxIteratorApi extends IteratorApi with Logging {
 
+  private def toColumnarBatchInIterator(
+      backendName: String,
+      iter: Iterator[ColumnarBatch]): ColumnarBatchInIterator = {
+    iter match {
+      case broadcastIter: VeloxBroadcastBuildSideIterator =>
+        val hashTableId = broadcastIter.buildHashTableId.orNull
+        new VeloxHashTableColumnarBatchInIterator(backendName, broadcastIter.asJava, hashTableId)
+      case other => new ColumnarBatchInIterator(backendName, other.asJava)
+    }
+  }
+
   override def genSplitInfo(
       partition: InputPartition,
       partitionSchema: StructType,
@@ -232,11 +243,11 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       inputPartition.isInstanceOf[GlutenPartition],
       "Velox backend only accept GlutenPartition.")
 
+    val backendName = BackendsApiManager.getBackendName
     val columnarNativeIterators =
-      new JArrayList[ColumnarBatchInIterator](inputIterators.map {
-        iter => new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iter.asJava)
-      }.asJava)
-    val transKernel = NativePlanEvaluator.create(BackendsApiManager.getBackendName)
+      new JArrayList[ColumnarBatchInIterator](inputIterators.map(iter =>
+        toColumnarBatchInIterator(backendName, iter)).asJava)
+    val transKernel = NativePlanEvaluator.create(backendName)
 
     val splitInfoByteArray = inputPartition
       .asInstanceOf[GlutenPartition]
@@ -287,11 +298,10 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       materializeInput: Boolean,
       enableCudf: Boolean = false): Iterator[ColumnarBatch] = {
 
-    val transKernel = NativePlanEvaluator.create(BackendsApiManager.getBackendName)
+    val backendName = BackendsApiManager.getBackendName
+    val transKernel = NativePlanEvaluator.create(backendName)
     val columnarNativeIterator =
-      inputIterators.map {
-        iter => new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iter.asJava)
-      }
+      inputIterators.map(iter => toColumnarBatchInIterator(backendName, iter))
     val spillDirPath = SparkDirectoryUtil
       .get()
       .namespace("gluten-spill")

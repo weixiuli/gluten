@@ -57,6 +57,7 @@ add_velox_test(
   Substrait2VeloxPlanConversionTest.cc
   Substrait2VeloxPlanValidatorTest.cc
   Substrait2VeloxValuesNodeConversionTest.cc
+  GlutenPrebuiltHashTableTest.cc
   SubstraitExtensionCollectorTest.cc
   VeloxSubstraitRoundTripTest.cc
   VeloxSubstraitSignatureTest.cc

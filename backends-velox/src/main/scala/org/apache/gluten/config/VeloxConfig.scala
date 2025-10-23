@@ -61,6 +61,9 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
   def enableBroadcastBuildRelationInOffheap: Boolean =
     getConf(VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP)
 
+  def enableVeloxPrebuiltHashTables: Boolean =
+    getConf(VELOX_PREBUILT_HASH_TABLE_ENABLED)
+
   def veloxOrcScanEnabled: Boolean =
     getConf(VELOX_ORC_SCAN_ENABLED)
 
@@ -528,6 +531,14 @@ object VeloxConfig extends ConfigRegistry {
         "Otherwise, broadcast build relation will use onheap memory.")
       .booleanConf
       .createWithDefault(false)
+
+  val VELOX_PREBUILT_HASH_TABLE_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.prebuiltHashTable.enabled")
+      .doc(
+        "Enable driver-side prebuilt Velox hash tables for broadcast joins. " +
+          "Disable to fall back to executor-side hash table construction.")
+      .booleanConf
+      .createWithDefault(true)
 
   val VELOX_HASHMAP_ABANDON_BUILD_DUPHASH_MIN_ROWS =
     buildConf("spark.gluten.velox.abandonbuild.noduphashminrows")

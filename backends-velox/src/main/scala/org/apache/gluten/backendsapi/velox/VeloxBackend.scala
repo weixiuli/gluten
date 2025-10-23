@@ -470,6 +470,8 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
   override def enableJoinKeysRewrite(): Boolean = false
 
+  override def enablePrebuiltHashTables(): Boolean = VeloxConfig.get.enableVeloxPrebuiltHashTables
+
   override def supportHashBuildJoinTypeOnLeft: JoinType => Boolean = {
     t =>
       if (super.supportHashBuildJoinTypeOnLeft(t)) {

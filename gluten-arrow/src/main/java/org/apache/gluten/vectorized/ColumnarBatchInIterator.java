@@ -42,4 +42,8 @@ public class ColumnarBatchInIterator {
     ColumnarBatches.checkOffloaded(next);
     return ColumnarBatches.getNativeHandle(backendName, next);
   }
+
+  public String getBuildHashTableId() {
+    return null;
+  }
 }
