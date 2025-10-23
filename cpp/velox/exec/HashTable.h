@@ -20,9 +20,6 @@
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
-#include "velox/vector/ComplexVector.h"
-
-#include <string>
 
 namespace facebook::velox::exec {
 
@@ -198,21 +195,6 @@ class BaseHashTable {
     bool initialized = false;
     char* nextHit;
     vector_size_t lastDuplicateRowIndex{0};
-  };
-
-  struct HashTableBuildInfo {
-    RowTypePtr tableType;
-    uint32_t numKeys{0};
-    bool ignoreNullKeys{false};
-    bool allowDuplicates{false};
-    bool isJoinBuild{false};
-    bool hasProbedFlag{false};
-    uint32_t minTableSizeForParallelJoinBuild{0};
-  };
-
-  struct SerializedHashTable {
-    HashTableBuildInfo info;
-    std::string serializedRows;
   };
 
   /// Takes ownership of 'hashers'. These are used to keep key-level
@@ -392,17 +374,6 @@ class BaseHashTable {
   /// join use.
   virtual std::vector<RowContainer*> allRows() const = 0;
 
-  virtual SerializedHashTable serialize() const = 0;
-
-  static std::unique_ptr<BaseHashTable> buildHashTable(
-      const HashTableBuildInfo& info,
-      const RowVectorPtr& rows,
-      memory::MemoryPool* pool);
-
-  static std::unique_ptr<BaseHashTable> deserialize(
-      const SerializedHashTable& serialized,
-      memory::MemoryPool* pool);
-
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
@@ -449,6 +420,19 @@ class BaseHashTable {
       folly::Range<char* const*> rows,
       int32_t columnIndex,
       const VectorPtr& result) = 0;
+
+  /// Serializes the hash table into a binary string that can be transferred to
+  /// another process. The serialized output contains all the metadata and the
+  /// payload rows required to reconstruct an equivalent hash table via
+  /// `BaseHashTable::deserialize`.
+  virtual std::string serialize() const = 0;
+
+  /// Deserializes a hash table from the binary string produced by
+  /// `serialize()`. The caller is responsible for providing the memory pool to
+  /// use for the resulting hash table.
+  static std::shared_ptr<BaseHashTable> deserialize(
+      const std::string& serialized,
+      memory::MemoryPool* pool);
 
  protected:
   static FOLLY_ALWAYS_INLINE size_t tableSlotSize() {
@@ -535,17 +519,6 @@ class HashTable : public BaseHashTable {
         minTableSizeForParallelJoinBuild,
         pool);
   }
-
-  SerializedHashTable serialize() const override;
-
-  static std::unique_ptr<HashTable> createFromRows(
-      const HashTableBuildInfo& info,
-      const RowVectorPtr& rows,
-      memory::MemoryPool* pool);
-
-  static std::unique_ptr<HashTable> createFromSerialized(
-      const SerializedHashTable& serialized,
-      memory::MemoryPool* pool);
 
   void groupProbe(HashLookup& lookup, int8_t spillInputStartPartitionBit)
       override;
@@ -701,6 +674,8 @@ class HashTable : public BaseHashTable {
         result);
   }
 
+  std::string serialize() const override;
+
   auto& testingOtherTables() const {
     return otherTables_;
   }
@@ -714,20 +689,6 @@ class HashTable : public BaseHashTable {
   }
 
  private:
-  static std::unique_ptr<HashTable> createEmpty(
-      const HashTableBuildInfo& info,
-      memory::MemoryPool* pool);
-
-  static void populateContainerFromVector(
-      HashTable& table,
-      const RowVectorPtr& rowsVector);
-
-  static void updateHasherStatistics(
-      HashTable& table,
-      const RowVectorPtr& rowsVector);
-
-  void finalizeTableBuild();
-
   // Enables debug stats for collisions for debug build.
 #ifdef NDEBUG
   static constexpr bool kTrackLoads = false;
@@ -1098,8 +1059,6 @@ class HashTable : public BaseHashTable {
 
   int8_t sizeBits_;
   bool isJoinBuild_ = false;
-  const bool allowDuplicates_;
-  const bool hasProbedFlag_;
 
   // Set at join build time if the table has duplicates, meaning that
   // the join can be cardinality increasing. Atomic for tsan because

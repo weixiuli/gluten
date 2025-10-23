@@ -19,97 +19,60 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/SimdUtil.h"
-#include "velox/common/memory/ByteStream.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
-#include "velox/vector/DecodedVector.h"
-#include "velox/vector/SelectivityVector.h"
-#include "velox/vector/VectorStream.h"
 #include "velox/vector/VectorTypeUtils.h"
 
-#include <fmt/format.h>
-#include <folly/Range.h>
-#include <folly/io/Cursor.h>
+#include <array>
+#include <cstring>
+
+#include <folly/dynamic.h>
+#include <folly/json.h>
 
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
 
-RowTypePtr buildRowTypeFromContainer(const RowContainer* rows) {
+constexpr uint32_t kHashTableSerializeMagic = 0x4854424c; // 'HTBL'
+constexpr uint32_t kHashTableSerializeVersion = 1;
+constexpr vector_size_t kSerializedRowBatchSize = 1024;
+
+RowTypePtr makeSerializedRowType(const std::vector<TypePtr>& types) {
   std::vector<std::string> names;
-  std::vector<TypePtr> types;
-  const auto& columnTypes = rows->columnTypes();
-  names.reserve(columnTypes.size());
-  types.reserve(columnTypes.size());
-  for (auto i = 0; i < columnTypes.size(); ++i) {
+  names.reserve(types.size());
+  for (vector_size_t i = 0; i < types.size(); ++i) {
     names.push_back(fmt::format("c{}", i));
-    types.push_back(columnTypes[i]);
   }
-  return ROW(std::move(names), std::move(types));
+  std::vector<TypePtr> children;
+  children.reserve(types.size());
+  for (auto& type : types) {
+    children.push_back(type);
+  }
+  return ROW(std::move(names), std::move(children));
 }
 
-RowVectorPtr extractRowsToVector(
-    RowContainer* rows,
-    const RowTypePtr& rowType,
-    memory::MemoryPool* pool) {
-  const auto totalRows = rows->numRows();
-  auto rowVector = std::dynamic_pointer_cast<RowVector>(
-      BaseVector::create(rowType, totalRows, pool));
-  if (totalRows == 0) {
-    return rowVector;
-  }
-  for (auto i = 0; i < rowType->size(); ++i) {
-    rowVector->childAt(i)->resize(totalRows);
-  }
+template <typename T>
+void appendPod(std::string& out, T value) {
+  out.append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
 
-  std::vector<bool> columnHasNulls(rowType->size());
-  for (auto i = 0; i < rowType->size(); ++i) {
-    columnHasNulls[i] = rows->columnHasNulls(i);
-  }
-
-  constexpr int32_t kBatch = 1024;
-  std::vector<char*> batch(kBatch);
-  RowContainerIterator iterator;
-  vector_size_t offset = 0;
-  while (auto numRows = rows->listRows(
-             &iterator, kBatch, RowContainer::kUnlimited, batch.data())) {
-    const auto* rawRows = reinterpret_cast<const char* const*>(batch.data());
-    for (auto column = 0; column < rowType->size(); ++column) {
-      RowContainer::extractColumn(
-          rawRows,
-          numRows,
-          rows->columnAt(column),
-          columnHasNulls[column],
-          offset,
-          rowVector->childAt(column));
-    }
-    offset += numRows;
-  }
-  return rowVector;
+template <typename T>
+T readPod(const std::string& in, size_t& offset) {
+  VELOX_CHECK_LE(
+      offset + sizeof(T),
+      in.size(),
+      "Not enough bytes remaining while deserializing hash table");
+  T value;
+  std::memcpy(&value, in.data() + offset, sizeof(T));
+  offset += sizeof(T);
+  return value;
 }
 
 } // namespace
-std::unique_ptr<BaseHashTable> BaseHashTable::buildHashTable(
-    const HashTableBuildInfo& info,
-    const RowVectorPtr& rows,
-    memory::MemoryPool* pool) {
-  if (info.ignoreNullKeys) {
-    return HashTable<true>::createFromRows(info, rows, pool);
-  }
-  return HashTable<false>::createFromRows(info, rows, pool);
-}
 
-std::unique_ptr<BaseHashTable> BaseHashTable::deserialize(
-    const SerializedHashTable& serialized,
-    memory::MemoryPool* pool) {
-  if (serialized.info.ignoreNullKeys) {
-    return HashTable<true>::createFromSerialized(serialized, pool);
-  }
-  return HashTable<false>::createFromSerialized(serialized, pool);
-}
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
   switch (mode) {
@@ -139,8 +102,6 @@ HashTable<ignoreNullKeys>::HashTable(
       pool_(pool),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       isJoinBuild_(isJoinBuild),
-      allowDuplicates_(allowDuplicates),
-      hasProbedFlag_(hasProbedFlag),
       buildPartitionBounds_(raw_vector<PartitionBoundIndexType>(pool)) {
   std::vector<TypePtr> keys;
   for (auto& hasher : hashers_) {
@@ -161,174 +122,6 @@ HashTable<ignoreNullKeys>::HashTable(
       hashMode_ != HashMode::kHash,
       pool);
   nextOffset_ = rows_->nextOffset();
-}
-
-template <bool ignoreNullKeys>
-std::unique_ptr<HashTable<ignoreNullKeys>>
-HashTable<ignoreNullKeys>::createEmpty(
-    const HashTableBuildInfo& info,
-    memory::MemoryPool* pool) {
-  VELOX_CHECK_NOT_NULL(info.tableType);
-  VELOX_CHECK_LE(info.numKeys, info.tableType->size());
-  VELOX_CHECK_EQ(info.ignoreNullKeys, ignoreNullKeys);
-
-  std::vector<std::unique_ptr<VectorHasher>> hashers;
-  hashers.reserve(info.numKeys);
-  for (uint32_t i = 0; i < info.numKeys; ++i) {
-    hashers.emplace_back(VectorHasher::create(info.tableType->childAt(i), i));
-  }
-
-  std::vector<TypePtr> dependentTypes;
-  dependentTypes.reserve(info.tableType->size() - info.numKeys);
-  for (auto i = info.numKeys; i < info.tableType->size(); ++i) {
-    dependentTypes.emplace_back(info.tableType->childAt(i));
-  }
-
-  std::vector<Accumulator> accumulators;
-  return std::make_unique<HashTable<ignoreNullKeys>>(
-      std::move(hashers),
-      accumulators,
-      dependentTypes,
-      info.allowDuplicates,
-      info.isJoinBuild,
-      info.hasProbedFlag,
-      info.minTableSizeForParallelJoinBuild,
-      pool);
-}
-
-template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::populateContainerFromVector(
-    HashTable& table,
-    const RowVectorPtr& rowsVector) {
-  if (!rowsVector || rowsVector->size() == 0) {
-    return;
-  }
-
-  auto* container = table.rows_.get();
-  const vector_size_t numRows = rowsVector->size();
-  std::vector<char*> newRows(numRows);
-  const auto nextOffset = container->nextOffset();
-  for (vector_size_t i = 0; i < numRows; ++i) {
-    char* row = container->newRow();
-    if (nextOffset) {
-      *reinterpret_cast<char**>(row + nextOffset) = nullptr;
-    }
-    newRows[i] = row;
-  }
-
-  SelectivityVector all(numRows);
-  DecodedVector decoded;
-  for (int32_t column = 0; column < rowsVector->type()->size(); ++column) {
-    decoded.decode(*rowsVector->childAt(column), all);
-    container->store(
-        decoded, folly::Range<char**>(newRows.data(), numRows), column);
-  }
-}
-
-template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::updateHasherStatistics(
-    HashTable& table,
-    const RowVectorPtr& rowsVector) {
-  if (!rowsVector || rowsVector->size() == 0) {
-    return;
-  }
-
-  raw_vector<uint64_t> hashes(table.pool_);
-  SelectivityVector all(rowsVector->size());
-  hashes.resize(all.end());
-  for (auto i = 0; i < table.hashers_.size(); ++i) {
-    auto& hasher = table.hashers_[i];
-    hasher->decode(*rowsVector->childAt(i), all);
-    hasher->computeValueIds(all, hashes);
-  }
-}
-
-template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::finalizeTableBuild() {
-  columnHasNulls_.resize(rows_->columnTypes().size());
-  for (auto i = 0; i < rows_->columnTypes().size(); ++i) {
-    columnHasNulls_[i] = rows_->columnHasNulls(i);
-  }
-  numDistinct_ = rows_->numRows();
-  if (numDistinct_ == 0) {
-    return;
-  }
-
-  decideHashMode(numDistinct_, BaseHashTable::kNoSpillInputStartPartitionBit);
-}
-
-template <bool ignoreNullKeys>
-std::unique_ptr<HashTable<ignoreNullKeys>>
-HashTable<ignoreNullKeys>::createFromRows(
-    const HashTableBuildInfo& info,
-    const RowVectorPtr& rows,
-    memory::MemoryPool* pool) {
-  auto table = createEmpty(info, pool);
-  HashTable<ignoreNullKeys>::populateContainerFromVector(*table, rows);
-  HashTable<ignoreNullKeys>::updateHasherStatistics(*table, rows);
-  table->finalizeTableBuild();
-  return table;
-}
-
-template <bool ignoreNullKeys>
-std::unique_ptr<HashTable<ignoreNullKeys>>
-HashTable<ignoreNullKeys>::createFromSerialized(
-    const SerializedHashTable& serialized,
-    memory::MemoryPool* pool) {
-  auto table = createEmpty(serialized.info, pool);
-
-  RowVectorPtr rowsVector;
-  if (!serialized.serializedRows.empty()) {
-    auto iobuf = folly::IOBuf::copyBuffer(
-        serialized.serializedRows.data(), serialized.serializedRows.size());
-    auto ranges = byteRangesFromIOBuf(iobuf.get());
-    auto input = std::make_unique<BufferInputStream>(std::move(ranges));
-    VectorStreamGroup::read(
-        input.get(),
-        pool,
-        serialized.info.tableType,
-        getVectorSerde(),
-        &rowsVector,
-        nullptr);
-  } else {
-    rowsVector = std::dynamic_pointer_cast<RowVector>(
-        BaseVector::create(serialized.info.tableType, 0, pool));
-  }
-
-  HashTable<ignoreNullKeys>::populateContainerFromVector(*table, rowsVector);
-  HashTable<ignoreNullKeys>::updateHasherStatistics(*table, rowsVector);
-  table->finalizeTableBuild();
-  return table;
-}
-
-template <bool ignoreNullKeys>
-BaseHashTable::SerializedHashTable HashTable<ignoreNullKeys>::serialize()
-    const {
-  SerializedHashTable result;
-  result.info.tableType = buildRowTypeFromContainer(rows_.get());
-  result.info.numKeys = hashers_.size();
-  result.info.ignoreNullKeys = ignoreNullKeys;
-  result.info.allowDuplicates = allowDuplicates_;
-  result.info.isJoinBuild = isJoinBuild_;
-  result.info.hasProbedFlag = hasProbedFlag_;
-  result.info.minTableSizeForParallelJoinBuild =
-      minTableSizeForParallelJoinBuild_;
-
-  auto rowsVector =
-      extractRowsToVector(rows_.get(), result.info.tableType, pool_);
-  VectorStreamGroup streamGroup(pool_, getVectorSerde());
-  streamGroup.createStreamTree(
-      result.info.tableType, rowsVector ? rowsVector->size() : 0);
-  streamGroup.append(rowsVector);
-  IOBufOutputStream output(*pool_);
-  streamGroup.flush(&output);
-  if (auto iobuf = output.getIOBuf()) {
-    folly::io::Cursor cursor(iobuf.get());
-    const auto chainLength = cursor.totalLength();
-    result.serializedRows.resize(chainLength);
-    cursor.pull(result.serializedRows.data(), chainLength);
-  }
-  return result;
 }
 
 class ProbeState {
@@ -2262,6 +2055,217 @@ int32_t HashTable<ignoreNullKeys>::listNotProbedRows(
     char** rows) {
   return listRows<RowContainer::ProbeType::kNotProbed>(
       iter, maxRows, maxBytes, rows);
+}
+
+template <bool ignoreNullKeys>
+std::string HashTable<ignoreNullKeys>::serialize() const {
+  VELOX_CHECK(
+      isJoinBuild_,
+      "Hash table serialization currently supports only join build tables");
+  auto rowContainers = allRows();
+  VELOX_CHECK(!rowContainers.empty());
+
+  const auto& firstTypes = rowContainers.front()->columnTypes();
+  for (auto* container : rowContainers) {
+    const auto& types = container->columnTypes();
+    VELOX_CHECK_EQ(
+        types.size(),
+        firstTypes.size(),
+        "Row containers must have matching schema for serialization");
+    for (auto i = 0; i < types.size(); ++i) {
+      VELOX_CHECK(
+          types[i]->equivalent(*firstTypes[i]),
+          "Mismatched column type at index {} while serializing hash table",
+          i);
+    }
+  }
+
+  std::string out;
+  appendPod(out, kHashTableSerializeMagic);
+  appendPod(out, kHashTableSerializeVersion);
+  const uint8_t ignoreFlag = ignoreNullKeys ? 1 : 0;
+  const uint8_t allowDuplicatesFlag = rows_->nextOffset() > 0 ? 1 : 0;
+  const uint8_t probedFlag = rows_->probedFlagOffset() > 0 ? 1 : 0;
+  const uint8_t reserved = 0;
+  appendPod(out, ignoreFlag);
+  appendPod(out, allowDuplicatesFlag);
+  appendPod(out, probedFlag);
+  appendPod(out, reserved);
+  appendPod(out, minTableSizeForParallelJoinBuild_);
+  const uint32_t numKeys = hashers_.size();
+  appendPod(out, numKeys);
+  appendPod(out, static_cast<uint32_t>(firstTypes.size()));
+
+  uint64_t totalRows = 0;
+  for (auto* container : rowContainers) {
+    totalRows += container->numRows();
+  }
+  appendPod(out, totalRows);
+
+  auto rowType = makeSerializedRowType(firstTypes);
+  auto typeJson = folly::toJson(rowType->serialize());
+  appendPod(out, static_cast<uint32_t>(typeJson.size()));
+  out.append(typeJson.data(), typeJson.size());
+
+  std::array<char*, kSerializedRowBatchSize> rows;
+  for (auto* container : rowContainers) {
+    RowContainerIterator iterator;
+    while (auto numRows = container->listRows(
+               &iterator, kSerializedRowBatchSize, rows.data())) {
+      auto serialized = BaseVector::create(VARCHAR(), numRows, container->pool());
+      container->extractSerializedRows(
+          folly::Range<char**>(rows.data(), numRows), serialized);
+      auto* flat = serialized->template as<FlatVector<StringView>>();
+      for (vector_size_t i = 0; i < numRows; ++i) {
+        auto view = flat->valueAt(i);
+        appendPod(out, static_cast<uint32_t>(view.size()));
+        out.append(view.data(), view.size());
+      }
+    }
+  }
+  return out;
+}
+
+namespace {
+
+template <bool ignoreNullKeys>
+std::shared_ptr<BaseHashTable> deserializeHashTable(
+    const std::string& serialized,
+    size_t& offset,
+    memory::MemoryPool* pool,
+    const RowTypePtr& rowType,
+    uint32_t numKeys,
+    bool allowDuplicates,
+    bool hasProbedFlag,
+    uint32_t minTableSizeForParallelJoinBuild,
+    uint64_t numRows) {
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.reserve(numKeys);
+  for (uint32_t i = 0; i < numKeys; ++i) {
+    hashers.emplace_back(VectorHasher::create(rowType->childAt(i), i));
+  }
+
+  std::vector<TypePtr> dependentTypes;
+  dependentTypes.reserve(rowType->size() - numKeys);
+  for (uint32_t i = numKeys; i < rowType->size(); ++i) {
+    dependentTypes.push_back(rowType->childAt(i));
+  }
+
+  auto tableUnique = HashTable<ignoreNullKeys>::createForJoin(
+      std::move(hashers),
+      dependentTypes,
+      allowDuplicates,
+      hasProbedFlag,
+      minTableSizeForParallelJoinBuild,
+      pool);
+
+  auto* rows = tableUnique->rows();
+  const auto nextOffset = rows->nextOffset();
+  auto serializedRow = BaseVector::create(VARCHAR(), 1, pool);
+  auto* flat = serializedRow->template as<FlatVector<StringView>>();
+  flat->resize(1);
+  for (uint64_t i = 0; i < numRows; ++i) {
+    const uint32_t rowSize = readPod<uint32_t>(serialized, offset);
+    VELOX_CHECK_LE(
+        offset + rowSize,
+        serialized.size(),
+        "Unexpected end of data while reading hash table rows");
+    const char* rowData = serialized.data() + offset;
+    offset += rowSize;
+    char* row = rows->newRow();
+    if (nextOffset) {
+      *reinterpret_cast<char**>(row + nextOffset) = nullptr;
+    }
+    flat->setNull(0, false);
+    flat->setNoCopy(0, StringView(rowData, rowSize));
+    rows->storeSerializedRow(*flat, 0, row);
+  }
+
+  tableUnique->prepareJoinTable(
+      {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+
+  auto tableShared =
+      std::shared_ptr<HashTable<ignoreNullKeys>>(std::move(tableUnique));
+  return std::static_pointer_cast<BaseHashTable>(tableShared);
+}
+
+} // namespace
+
+std::shared_ptr<BaseHashTable> BaseHashTable::deserialize(
+    const std::string& serialized,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(pool);
+  size_t offset = 0;
+  const auto magic = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_EQ(
+      magic,
+      kHashTableSerializeMagic,
+      "Invalid hash table serialization header");
+  const auto version = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_EQ(
+      version,
+      kHashTableSerializeVersion,
+      "Unsupported hash table serialization version: {}",
+      version);
+  const auto ignoreFlag = readPod<uint8_t>(serialized, offset);
+  const auto allowDuplicatesFlag = readPod<uint8_t>(serialized, offset);
+  const auto probedFlag = readPod<uint8_t>(serialized, offset);
+  (void)readPod<uint8_t>(serialized, offset); // reserved
+  const auto minTableSize = readPod<uint32_t>(serialized, offset);
+  const auto numKeys = readPod<uint32_t>(serialized, offset);
+  const auto numColumns = readPod<uint32_t>(serialized, offset);
+  const auto numRows = readPod<uint64_t>(serialized, offset);
+  const auto typeJsonSize = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_LE(
+      offset + typeJsonSize,
+      serialized.size(),
+      "Invalid hash table serialization: truncated type information");
+  std::string typeJson(serialized.data() + offset, typeJsonSize);
+  offset += typeJsonSize;
+
+  auto typeDynamic = folly::parseJson(typeJson);
+  auto type = Type::create(typeDynamic);
+  auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+  VELOX_CHECK_NOT_NULL(rowType, "Serialized hash table must use ROW type");
+  VELOX_CHECK_EQ(
+      rowType->size(),
+      numColumns,
+      "Mismatch between serialized column count and row type");
+  VELOX_CHECK_GE(
+      rowType->size(),
+      numKeys,
+      "Serialized hash table contains more keys than columns");
+
+  std::shared_ptr<BaseHashTable> table;
+  if (ignoreFlag) {
+    table = deserializeHashTable<true>(
+        serialized,
+        offset,
+        pool,
+        rowType,
+        numKeys,
+        allowDuplicatesFlag != 0,
+        probedFlag != 0,
+        minTableSize,
+        numRows);
+  } else {
+    table = deserializeHashTable<false>(
+        serialized,
+        offset,
+        pool,
+        rowType,
+        numKeys,
+        allowDuplicatesFlag != 0,
+        probedFlag != 0,
+        minTableSize,
+        numRows);
+  }
+
+  VELOX_CHECK_EQ(
+      offset,
+      serialized.size(),
+      "Unexpected trailing bytes in hash table serialization");
+  return table;
 }
 
 template <bool ignoreNullKeys>
