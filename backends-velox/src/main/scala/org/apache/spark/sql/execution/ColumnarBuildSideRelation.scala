@@ -65,6 +65,20 @@ case class ColumnarBuildSideRelation(
   extends BuildSideRelation
   with KnownSizeEstimation {
 
+  private val veloxHashTables = scala.collection.mutable.HashMap.empty[String, Array[Byte]]
+
+  def registerVeloxHashTable(hashTableId: String, serialized: Array[Byte]): Unit = synchronized {
+    veloxHashTables.update(hashTableId, serialized)
+  }
+
+  def getVeloxHashTable(hashTableId: String): Option[Array[Byte]] = synchronized {
+    veloxHashTables.get(hashTableId)
+  }
+
+  def hasVeloxHashTable(hashTableId: String): Boolean = synchronized {
+    veloxHashTables.contains(hashTableId)
+  }
+
   // Rebuild the real BroadcastMode on demand; never serialize it.
   @transient override lazy val mode: BroadcastMode =
     BroadcastModeUtils.fromSafe(safeBroadcastMode, output)
