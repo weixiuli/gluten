@@ -16,22 +16,56 @@
  */
 package org.apache.gluten.execution
 
+import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.config.VeloxConfig
 import org.apache.gluten.iterator.Iterators
+import org.apache.gluten.runtime.Runtimes
+import org.apache.gluten.vectorized.VeloxHashTableJniWrapper
 
-import org.apache.spark.{broadcast, SparkContext}
+import org.apache.spark.{SparkContext, TaskContext, broadcast}
+import org.apache.spark.sql.execution.VeloxHashTableBuildSideRelation
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 case class VeloxBroadcastBuildSideRDD(
     @transient private val sc: SparkContext,
-    broadcasted: broadcast.Broadcast[BuildSideRelation])
+    broadcasted: broadcast.Broadcast[BuildSideRelation],
+    context: Option[VeloxBroadCastHashJoinContext] = None)
   extends BroadcastBuildSideRDD(sc, broadcasted) {
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
     val relation = broadcasted.value.asReadOnlyCopy()
-    Iterators
-      .wrap(relation.deserialized)
-      .recyclePayload(batch => batch.close())
-      .create()
+    val veloxConfig = VeloxConfig.get
+    (context, relation) match {
+      case (Some(hashContext), veloxRelation: VeloxHashTableBuildSideRelation)
+          if veloxConfig.enableBroadcastHashTableCache &&
+            veloxRelation.getVeloxHashTable(hashContext.buildHashTableId).isDefined =>
+        val serialized = veloxRelation
+          .getVeloxHashTable(hashContext.buildHashTableId)
+          .get
+        val runtime =
+          Runtimes.contextInstance(
+            BackendsApiManager.getBackendName,
+            "VeloxBroadcastBuildSideRDD#genBroadcastBuildSideIterator")
+        val jniWrapper = VeloxHashTableJniWrapper.create(runtime)
+        val hashTableId = hashContext.buildHashTableId
+        jniWrapper.register(hashTableId, serialized)
+        Option(TaskContext.get()).foreach { tc =>
+          tc.addTaskCompletionListener[Unit] { _ =>
+            try {
+              jniWrapper.unregister(hashTableId)
+            } catch {
+              case _: Throwable =>
+              // Ignore cleanup exceptions to avoid masking task failures.
+            }
+          }
+        }
+        Iterator.empty
+      case _ =>
+        Iterators
+          .wrap(relation.deserialized)
+          .recyclePayload(batch => batch.close())
+          .create()
+    }
   }
 }
