@@ -16,11 +16,12 @@
  */
 package org.apache.gluten.execution
 
+import org.apache.gluten.config.VeloxConfig
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.BuildSide
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{SparkPlan, VeloxHashTableBuildSideRelation}
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -126,7 +127,33 @@ case class BroadcastHashJoinExecTransformer(
   override def columnarInputRDDs: Seq[RDD[ColumnarBatch]] = {
     val streamedRDD = getColumnarInputRDDs(streamedPlan)
     val broadcast = buildPlan.executeBroadcast[BuildSideRelation]()
-    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast)
+    val contextOpt =
+      if (VeloxConfig.get.enableBroadcastHashTableCache && buildSide == BuildRight) {
+        VeloxBroadcastHashTableBuilder
+          .computeKeyOrdinals(buildKeyExprs, buildPlan.output)
+          .map(
+            ordinals =>
+              VeloxBroadCastHashJoinContext(
+                buildHashTableId,
+                ordinals,
+                joinType,
+                buildSide,
+                isNullAwareAntiJoin,
+                condition.isDefined))
+      } else {
+        None
+      }
+
+    contextOpt.foreach {
+      ctx =>
+        broadcast.value match {
+          case relation: VeloxHashTableBuildSideRelation =>
+            VeloxBroadcastHashTableBuilder.buildIfNeeded(relation, ctx)
+          case _ =>
+        }
+    }
+
+    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast, contextOpt)
     // FIXME: Do we have to make build side a RDD?
     streamedRDD :+ broadcastRDD
   }
