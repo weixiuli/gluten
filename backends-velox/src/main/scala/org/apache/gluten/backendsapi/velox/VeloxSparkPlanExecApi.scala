@@ -668,6 +668,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       child: SparkPlan,
       numOutputRows: SQLMetric,
       dataSize: SQLMetric): BuildSideRelation = {
+    val (effectiveMode, embeddedContext) = VeloxBroadcastHashTableMode.unwrap(mode)
     val useOffheapBroadcastBuildRelation =
       VeloxConfig.get.enableBroadcastBuildRelationInOffheap
     val serialized: Array[ColumnarBatchSerializeResult] = child
@@ -684,17 +685,27 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
+    val serializedBatches = serialized.flatMap(_.getSerialized)
     if (useOffheapBroadcastBuildRelation) {
       TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+        UnsafeColumnarBuildSideRelation(child.output, serializedBatches, effectiveMode)
       }
+    } else if (VeloxConfig.get.enableBroadcastHashTableCache) {
+      VeloxBroadcastHashTableBuilder
+        .buildSerializedHashTables(
+          child.output,
+          serializedBatches,
+          effectiveMode,
+          context = embeddedContext)
+        .getOrElse(ColumnarBuildSideRelation(child.output, serializedBatches, effectiveMode))
     } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+      ColumnarBuildSideRelation(child.output, serializedBatches, effectiveMode)
     }
   }
 
   override def doCanonicalizeForBroadcastMode(mode: BroadcastMode): BroadcastMode = {
-    mode match {
+    val (effectiveMode, contextOpt) = VeloxBroadcastHashTableMode.unwrap(mode)
+    val canonical = effectiveMode match {
       case hash: HashedRelationBroadcastMode =>
         // Node: It's different with vanilla Spark.
         // Vanilla Spark build HashRelation at driver side, so it is build keys sensitive.
@@ -702,8 +713,9 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
         // the build keys are actually meaningless for the broadcast value.
         // This change allows us reuse broadcast exchange for different build keys with same table.
         hash.copy(key = Seq.empty)
-      case _ => mode.canonicalized
+      case _ => effectiveMode.canonicalized
     }
+    contextOpt.map(VeloxBroadcastHashTableMode(canonical, _)).getOrElse(canonical)
   }
 
   /**

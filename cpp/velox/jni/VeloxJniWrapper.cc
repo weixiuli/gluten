@@ -20,9 +20,11 @@
 #include <glog/logging.h>
 #include <jni/JniCommon.h>
 #include <velox/connectors/hive/PartitionIdGenerator.h>
+#include <velox/core/PlanNode.h>
 #include <velox/exec/OperatorUtils.h>
 
 #include <exception>
+#include <vector>
 #include "JniUdf.h"
 #include "compute/Runtime.h"
 #include "compute/VeloxBackend.h"
@@ -36,6 +38,8 @@
 #include "substrait/SubstraitToVeloxPlanValidator.h"
 #include "utils/ObjectStore.h"
 #include "utils/VeloxBatchResizer.h"
+#include "exec/VeloxHashTableRegistry.h"
+#include "velox/exec/HashTableBuilder.h"
 #include "velox/common/base/BloomFilter.h"
 #include "velox/common/file/FileSystems.h"
 
@@ -56,6 +60,56 @@ jmethodID infoClsInitMethod;
 
 jclass blockStripesClass;
 jmethodID blockStripesConstructor;
+
+struct VeloxHashTableBuilderHolder {
+  VeloxHashTableBuilderHolder(
+      facebook::velox::memory::MemoryPool* pool,
+      facebook::velox::RowTypePtr inputType,
+      std::vector<int32_t> keyChannels,
+      facebook::velox::core::JoinType joinType,
+      bool nullAware,
+      bool hasFilter,
+      uint32_t minTableSizeForParallelJoinBuild)
+      : inputType_(std::move(inputType)) {
+    builder_ = std::make_unique<facebook::velox::exec::HashTableBuilder>(
+        pool,
+        inputType_,
+        std::move(keyChannels),
+        joinType,
+        nullAware,
+        hasFilter,
+        minTableSizeForParallelJoinBuild);
+  }
+
+  void addInput(const facebook::velox::RowVectorPtr& input) {
+    if (builder_) {
+      builder_->addInput(input);
+    }
+  }
+
+  std::string serialize() {
+    ensureBuilt();
+    return table_->serialize();
+  }
+
+  void close() {
+    builder_.reset();
+    table_.reset();
+    inputType_.reset();
+  }
+
+ private:
+  void ensureBuilt() {
+    if (!table_ && builder_) {
+      table_ = builder_->build();
+      builder_.reset();
+    }
+  }
+
+  facebook::velox::RowTypePtr inputType_;
+  std::unique_ptr<facebook::velox::exec::HashTableBuilder> builder_;
+  std::shared_ptr<facebook::velox::exec::BaseHashTable> table_;
+};
 } // namespace
 
 #ifdef __cplusplus
@@ -730,6 +784,140 @@ JNIEXPORT jboolean JNICALL Java_org_apache_gluten_config_ConfigJniWrapper_isEnha
 #else
   return false;
 #endif
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_utils_VeloxHashTableBuilderJniWrapper_create( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong batchHandle,
+    jintArray keyChannels,
+    jint joinTypeOrdinal,
+    jboolean nullAware,
+    jboolean hasFilter) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  GLUTEN_CHECK(runtime != nullptr, "Velox runtime expected");
+
+  auto pool = runtime->memoryManager()->getLeafMemoryPool();
+
+  auto batch = ObjectStore::retrieve<ColumnarBatch>(batchHandle);
+  GLUTEN_CHECK(batch != nullptr, "Invalid columnar batch handle");
+  auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(batch);
+  GLUTEN_CHECK(veloxBatch != nullptr, "Expected VeloxColumnarBatch");
+
+  auto rowVector = veloxBatch->getRowVector();
+  auto rowType = std::dynamic_pointer_cast<const facebook::velox::RowType>(rowVector->type());
+  GLUTEN_CHECK(rowType != nullptr, "Expected row type for build input");
+
+  const auto numKeys = env->GetArrayLength(keyChannels);
+  GLUTEN_CHECK(numKeys > 0, "Hash table requires at least one key channel");
+  std::vector<int32_t> keyChannelsVec(numKeys);
+  env->GetIntArrayRegion(keyChannels, 0, numKeys, keyChannelsVec.data());
+
+  GLUTEN_CHECK(
+      joinTypeOrdinal >= 0 &&
+          joinTypeOrdinal < static_cast<jint>(facebook::velox::core::JoinType::kNumJoinTypes),
+      "Invalid join type ordinal");
+
+  const auto joinType = static_cast<facebook::velox::core::JoinType>(joinTypeOrdinal);
+  const bool isNullAware = nullAware == JNI_TRUE;
+  const bool hasJoinFilter = hasFilter == JNI_TRUE;
+  constexpr uint32_t kMinTableSizeForParallelJoinBuild = 0;
+
+  auto holder = std::make_shared<VeloxHashTableBuilderHolder>(
+      pool.get(),
+      rowType,
+      std::move(keyChannelsVec),
+      joinType,
+      isNullAware,
+      hasJoinFilter,
+      kMinTableSizeForParallelJoinBuild);
+
+  return ctx->saveObject(holder);
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_utils_VeloxHashTableBuilderJniWrapper_addInput( // NOLINT
+    JNIEnv* env,
+    jobject /* wrapper */,
+    jlong builderHandle,
+    jlong batchHandle) {
+  JNI_METHOD_START
+  auto holder = ObjectStore::retrieve<VeloxHashTableBuilderHolder>(builderHandle);
+  GLUTEN_CHECK(holder != nullptr, "Invalid hash table builder handle");
+
+  auto batch = ObjectStore::retrieve<ColumnarBatch>(batchHandle);
+  GLUTEN_CHECK(batch != nullptr, "Invalid columnar batch handle");
+  auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(batch);
+  GLUTEN_CHECK(veloxBatch != nullptr, "Expected VeloxColumnarBatch");
+
+  holder->addInput(veloxBatch->getRowVector());
+  JNI_METHOD_END()
+}
+
+JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_utils_VeloxHashTableBuilderJniWrapper_serialize( // NOLINT
+    JNIEnv* env,
+    jobject /* wrapper */,
+    jlong builderHandle) {
+  JNI_METHOD_START
+  auto holder = ObjectStore::retrieve<VeloxHashTableBuilderHolder>(builderHandle);
+  GLUTEN_CHECK(holder != nullptr, "Invalid hash table builder handle");
+
+  const auto serialized = holder->serialize();
+  auto result = env->NewByteArray(serialized.size());
+  if (serialized.size() > 0) {
+    env->SetByteArrayRegion(
+        result, 0, serialized.size(), reinterpret_cast<const jbyte*>(serialized.data()));
+  }
+  return result;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_utils_VeloxHashTableBuilderJniWrapper_close( // NOLINT
+    JNIEnv* env,
+    jobject /* wrapper */,
+    jlong builderHandle) {
+  JNI_METHOD_START
+  auto holder = ObjectStore::retrieve<VeloxHashTableBuilderHolder>(builderHandle);
+  if (holder != nullptr) {
+    holder->close();
+  }
+  ObjectStore::release(builderHandle);
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_utils_VeloxHashTableJniWrapper_register( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jstring hashTableId,
+    jbyteArray serialized) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  GLUTEN_CHECK(runtime != nullptr, "Velox runtime expected");
+
+  auto pool = runtime->memoryManager()->getLeafMemoryPool();
+  GLUTEN_CHECK(pool != nullptr, "Velox memory pool unavailable");
+
+  std::string id = jStringToCString(env, hashTableId);
+  const auto length = env->GetArrayLength(serialized);
+  std::string buffer(length, '\0');
+  if (length > 0) {
+    env->GetByteArrayRegion(serialized, 0, length, reinterpret_cast<jbyte*>(buffer.data()));
+  }
+  VeloxHashTableRegistry::instance().registerSerialized(id, buffer, pool.get());
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_utils_VeloxHashTableJniWrapper_unregister( // NOLINT
+    JNIEnv* env,
+    jobject /* wrapper */,
+    jstring hashTableId) {
+  JNI_METHOD_START
+  std::string id = jStringToCString(env, hashTableId);
+  VeloxHashTableRegistry::instance().unregister(id);
+  JNI_METHOD_END()
 }
 
 #ifdef GLUTEN_ENABLE_GPU

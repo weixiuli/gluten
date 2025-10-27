@@ -61,6 +61,9 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
   def enableBroadcastBuildRelationInOffheap: Boolean =
     getConf(VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP)
 
+  override def enableBroadcastHashTableCache: Boolean =
+    super.enableBroadcastHashTableCache && getConf(VELOX_BROADCAST_HASH_TABLE_CACHE_ENABLED)
+
   def veloxOrcScanEnabled: Boolean =
     getConf(VELOX_ORC_SCAN_ENABLED)
 
@@ -526,6 +529,15 @@ object VeloxConfig extends ConfigRegistry {
       .experimental()
       .doc("Experimental: If enabled, broadcast build relation will use offheap memory. " +
         "Otherwise, broadcast build relation will use onheap memory.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val VELOX_BROADCAST_HASH_TABLE_CACHE_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.broadcast.hashTableCache.enabled")
+      .experimental()
+      .doc(
+        "Experimental: Enable caching of serialized broadcast hash tables for reuse on Velox executors. " +
+          "If disabled, executors will rebuild hash tables from deserialized batches.")
       .booleanConf
       .createWithDefault(false)
 

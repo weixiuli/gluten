@@ -22,8 +22,14 @@ import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarSubqueryBroadcastExec, InputIteratorTransformer}
+import org.apache.spark.sql.execution.{
+  ColumnarBroadcastExchangeExec,
+  ColumnarBuildSideRelation,
+  ColumnarSubqueryBroadcastExec,
+  InputIteratorTransformer
+}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec}
+import org.apache.spark.sql.internal.SQLConf
 
 class VeloxHashJoinSuite extends VeloxWholeStageTransformerSuite {
   override protected val resourcePath: String = "/tpch-data-parquet"
