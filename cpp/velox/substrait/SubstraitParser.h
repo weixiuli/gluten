@@ -27,6 +27,7 @@
 #include "substrait/type_expressions.pb.h"
 
 #include <google/protobuf/wrappers.pb.h>
+#include <optional>
 
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/type/Type.h"
@@ -92,6 +93,10 @@ class SubstraitParser {
   /// @param config the key string of a config.
   /// @return Whether the config is set as true.
   static bool configSetInOptimization(const ::substrait::extensions::AdvancedExtension&, const std::string& config);
+
+  static std::optional<std::string> findConfigValueInOptimization(
+      const ::substrait::extensions::AdvancedExtension&,
+      const std::string& key);
 
   /// Extract input types from Substrait function signature.
   static std::vector<facebook::velox::TypePtr> sigToTypes(const std::string& functionSig);
