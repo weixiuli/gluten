@@ -19,6 +19,7 @@
 
 #include "TypeUtils.h"
 #include "VariantToVectorConverter.h"
+#include "exec/VeloxHashTableRegistry.h"
 #include "operators/plannodes/RowVectorStream.h"
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/exec/TableWriter.h"
@@ -30,6 +31,9 @@
 #include "config.pb.h"
 #include "config/GlutenConfig.h"
 #include "config/VeloxConfig.h"
+
+#include <algorithm>
+#include <cctype>
 
 #ifdef GLUTEN_ENABLE_GPU
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
@@ -330,6 +334,28 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     filter = exprConverter_->toVeloxExpr(sJoin.post_join_filter(), inputRowType);
   }
 
+  void* reusedHashTableAddress = nullptr;
+  if (sJoin.has_advanced_extension()) {
+    auto hashTableIdOpt = SubstraitParser::findConfigValueInOptimization(
+        sJoin.advanced_extension(), "buildHashTableId=");
+    if (hashTableIdOpt.has_value()) {
+      auto hashTableId = hashTableIdOpt.value();
+      hashTableId.erase(
+          hashTableId.begin(),
+          std::find_if(hashTableId.begin(), hashTableId.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+      hashTableId.erase(
+          std::find_if(hashTableId.rbegin(), hashTableId.rend(), [](unsigned char ch) { return !std::isspace(ch); })
+              .base(),
+          hashTableId.end());
+      if (!hashTableId.empty()) {
+        auto table = VeloxHashTableRegistry::instance().get(hashTableId);
+        if (table != nullptr) {
+          reusedHashTableAddress = table.get();
+        }
+      }
+    }
+  }
+
   if (sJoin.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isSMJ=")) {
     // Create MergeJoinNode node
@@ -354,7 +380,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
         filter,
         leftNode,
         rightNode,
-        getJoinOutputType(leftNode, rightNode, joinType));
+        getJoinOutputType(leftNode, rightNode, joinType),
+        reusedHashTableAddress);
   }
 }
 

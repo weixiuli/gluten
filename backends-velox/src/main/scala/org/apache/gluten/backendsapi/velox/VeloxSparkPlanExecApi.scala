@@ -20,6 +20,7 @@ import org.apache.gluten.backendsapi.SparkPlanExecApi
 import org.apache.gluten.config.{GlutenConfig, HashShuffleWriterType, ReservedKeys, RssSortShuffleWriterType, ShuffleWriterType, SortShuffleWriterType, VeloxConfig}
 import org.apache.gluten.exception.{GlutenExceptionUtil, GlutenNotSupportException}
 import org.apache.gluten.execution._
+import org.apache.gluten.execution.VeloxBroadcastHashJoinTags.BroadcastContextTag
 import org.apache.gluten.expression._
 import org.apache.gluten.expression.aggregate.{HLLAdapter, VeloxBloomFilterAggregate, VeloxCollectList, VeloxCollectSet}
 import org.apache.gluten.extension.columnar.FallbackTags
@@ -668,6 +669,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       child: SparkPlan,
       numOutputRows: SQLMetric,
       dataSize: SQLMetric): BuildSideRelation = {
+    val resolvedContext = child.getTagValue(BroadcastContextTag)
     val useOffheapBroadcastBuildRelation =
       VeloxConfig.get.enableBroadcastBuildRelationInOffheap
     val serialized: Array[ColumnarBatchSerializeResult] = child
@@ -684,12 +686,21 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     }
     numOutputRows += serialized.map(_.getNumRows).sum
     dataSize += rawSize
+    val serializedBatches = serialized.flatMap(_.getSerialized)
     if (useOffheapBroadcastBuildRelation) {
       TaskResources.runUnsafe {
-        UnsafeColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+        UnsafeColumnarBuildSideRelation(child.output, serializedBatches, mode)
       }
+    } else if (VeloxConfig.get.enableBroadcastHashTableCache) {
+      VeloxBroadcastHashTableBuilder
+        .buildSerializedHashTables(
+          child.output,
+          serializedBatches,
+          mode,
+          context = resolvedContext)
+        .getOrElse(ColumnarBuildSideRelation(child.output, serializedBatches, mode))
     } else {
-      ColumnarBuildSideRelation(child.output, serialized.flatMap(_.getSerialized), mode)
+      ColumnarBuildSideRelation(child.output, serializedBatches, mode)
     }
   }
 
@@ -702,7 +713,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
         // the build keys are actually meaningless for the broadcast value.
         // This change allows us reuse broadcast exchange for different build keys with same table.
         hash.copy(key = Seq.empty)
-      case _ => mode.canonicalized
+      case other => other.canonicalized
     }
   }
 
