@@ -16,11 +16,19 @@
  */
 package org.apache.gluten.execution
 
+import org.apache.gluten.config.VeloxConfig
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.BuildSide
+import org.apache.spark.sql.catalyst.optimizer.BuildSide.BuildRight
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.plans.physical.{
+  BroadcastDistribution,
+  Distribution,
+  HashedRelationBroadcastMode,
+  UnspecifiedDistribution
+}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, SparkPlan}
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -123,10 +131,53 @@ case class BroadcastHashJoinExecTransformer(
       newRight: SparkPlan): BroadcastHashJoinExecTransformer =
     copy(left = newLeft, right = newRight)
 
+  private val broadcastContextOpt: Option[VeloxBroadCastHashJoinContext] =
+    registerBroadcastContext()
+
+  private def registerBroadcastContext(): Option[VeloxBroadCastHashJoinContext] = {
+    val contextOpt = computeBroadcastContext()
+    contextOpt.foreach { context =>
+      buildPlan match {
+        case exchange: ColumnarBroadcastExchangeExec =>
+          exchange.child.setTagValue(VeloxBroadcastHashJoinTags.BroadcastContextTag, context)
+        case other =>
+          other.setTagValue(VeloxBroadcastHashJoinTags.BroadcastContextTag, context)
+      }
+    }
+    contextOpt
+  }
+
+  private def computeBroadcastContext(): Option[VeloxBroadCastHashJoinContext] = {
+    if (VeloxConfig.get.enableBroadcastHashTableCache && buildSide == BuildRight) {
+      VeloxBroadcastHashTableBuilder
+        .computeKeyOrdinals(buildKeyExprs, buildPlan.output)
+        .map(ordinals =>
+          VeloxBroadCastHashJoinContext(
+            buildHashTableId,
+            ordinals,
+            joinType,
+            buildSide,
+            isNullAwareAntiJoin,
+            condition.isDefined))
+    } else {
+      None
+    }
+  }
+
+  override def requiredChildDistribution: Seq[Distribution] = {
+    val broadcastMode = HashedRelationBroadcastMode(buildKeyExprs, isNullAwareAntiJoin)
+    buildSide match {
+      case BuildLeft => BroadcastDistribution(broadcastMode) :: UnspecifiedDistribution :: Nil
+      case BuildRight => UnspecifiedDistribution :: BroadcastDistribution(broadcastMode) :: Nil
+    }
+  }
+
   override def columnarInputRDDs: Seq[RDD[ColumnarBatch]] = {
     val streamedRDD = getColumnarInputRDDs(streamedPlan)
+    val contextOpt = broadcastContextOpt
     val broadcast = buildPlan.executeBroadcast[BuildSideRelation]()
-    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast)
+
+    val broadcastRDD = VeloxBroadcastBuildSideRDD(sparkContext, broadcast, contextOpt)
     // FIXME: Do we have to make build side a RDD?
     streamedRDD :+ broadcastRDD
   }

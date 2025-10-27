@@ -22,8 +22,16 @@ import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarSubqueryBroadcastExec, InputIteratorTransformer}
+import org.apache.spark.sql.execution.{
+  ColumnarBroadcastExchangeExec,
+  ColumnarBuildSideRelation,
+  ColumnarSubqueryBroadcastExec,
+  InputIteratorTransformer,
+  VeloxHashTableBuildSideRelation
+}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec}
+import org.apache.spark.sql.execution.joins.BuildSideRelation
+import org.apache.spark.sql.internal.SQLConf
 
 class VeloxHashJoinSuite extends VeloxWholeStageTransformerSuite {
   override protected val resourcePath: String = "/tpch-data-parquet"
@@ -229,6 +237,83 @@ class VeloxHashJoinSuite extends VeloxWholeStageTransformerSuite {
             assert(buildKeysAttrs.exists(_.size > 1))
           }
         })
+  }
+
+  test("Velox broadcast hash table cache populates broadcast relation when enabled") {
+    withSQLConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> (10 * 1024 * 1024).toString,
+      "spark.sql.adaptive.enabled" -> "false",
+      GlutenConfig.COLUMNAR_BROADCAST_HASH_TABLE_ENABLED.key -> "true",
+      GlutenConfig.COLUMNAR_BROADCAST_HASH_TABLE_CACHE_ENABLED.key -> "true",
+      VeloxConfig.VELOX_BROADCAST_HASH_TABLE_CACHE_ENABLED.key -> "true",
+      VeloxConfig.VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP.key -> "false") {
+      withTable("velox_cache_left", "velox_cache_right") {
+        Seq((0, "l0"), (1, "l1"), (2, "l2")).toDF("id", "value").write.saveAsTable("velox_cache_left")
+        Seq((0, "r0"), (1, "r1"), (3, "r3")).toDF("id", "value").write.saveAsTable("velox_cache_right")
+
+        val df = spark.sql(
+          """
+            |SELECT /*+ BROADCAST(r) */ l.id, r.value
+            |FROM velox_cache_left l
+            |JOIN velox_cache_right r ON l.id = r.id
+            |""".stripMargin)
+
+        val plan = df.queryExecution.executedPlan
+        val exchanges = collect(plan) { case b: ColumnarBroadcastExchangeExec => b }
+        assert(exchanges.size == 1)
+
+        val taggedContext =
+          exchanges.head.child.getTagValue(VeloxBroadcastHashJoinTags.BroadcastContextTag)
+
+        val relation = exchanges.head.executeBroadcast[BuildSideRelation]().value
+        val veloxRelation = relation match {
+          case v: VeloxHashTableBuildSideRelation => v
+          case other => fail(s"Expected VeloxHashTableBuildSideRelation but found ${other.getClass}")
+        }
+
+        assert(veloxRelation.hashTables.nonEmpty)
+        assert(taggedContext.nonEmpty)
+
+        val join = collect(plan) { case j: BroadcastHashJoinExecTransformer => j }.head
+        val context = veloxRelation.context.getOrElse(fail("Missing broadcast hash join context"))
+        assert(taggedContext.contains(context))
+        assert(context.buildHashTableId == join.buildHashTableId)
+        assert(context.keyOrdinals == Seq(0))
+        assert(context.buildSide == join.buildSide)
+        assert(context.joinType == join.joinType)
+        assert(context.isNullAwareAntiJoin == join.isNullAwareAntiJoin)
+        assert(context.hasFilter == join.condition.isDefined)
+      }
+    }
+  }
+
+  test("Velox broadcast hash table cache falls back when disabled") {
+    withSQLConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> (10 * 1024 * 1024).toString,
+      "spark.sql.adaptive.enabled" -> "false",
+      GlutenConfig.COLUMNAR_BROADCAST_HASH_TABLE_ENABLED.key -> "true",
+      GlutenConfig.COLUMNAR_BROADCAST_HASH_TABLE_CACHE_ENABLED.key -> "false",
+      VeloxConfig.VELOX_BROADCAST_HASH_TABLE_CACHE_ENABLED.key -> "true",
+      VeloxConfig.VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP.key -> "false") {
+      withTable("velox_cache_disabled_left", "velox_cache_disabled_right") {
+        Seq((0, "l0"), (1, "l1"), (2, "l2")).toDF("id", "value").write.saveAsTable("velox_cache_disabled_left")
+        Seq((0, "r0"), (1, "r1"), (3, "r3")).toDF("id", "value").write.saveAsTable("velox_cache_disabled_right")
+
+        val df = spark.sql(
+          """
+            |SELECT /*+ BROADCAST(r) */ l.id
+            |FROM velox_cache_disabled_left l
+            |JOIN velox_cache_disabled_right r ON l.id = r.id
+            |""".stripMargin)
+
+        val plan = df.queryExecution.executedPlan
+        val exchanges = collect(plan) { case b: ColumnarBroadcastExchangeExec => b }
+        assert(exchanges.size == 1)
+
+        val relation = exchanges.head.executeBroadcast[BuildSideRelation]().value
+        assert(relation.isInstanceOf[ColumnarBuildSideRelation])
+      }
+    }
   }
 
   test("pull out duplicate projections for HashProbe and FilterProject") {
