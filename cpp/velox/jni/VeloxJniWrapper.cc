@@ -33,11 +33,21 @@
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
 #include "shuffle/rss/RssPartitionWriter.h"
+#include "substrait/SubstraitParser.h"
 #include "substrait/SubstraitToVeloxPlanValidator.h"
+#include "substrait/VeloxToSubstraitType.h"
 #include "utils/ObjectStore.h"
 #include "utils/VeloxBatchResizer.h"
 #include "velox/common/base/BloomFilter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/exec/HashTable.h"
+#include "velox/type/Type.h"
+#include "velox/vector/VectorSerde.h"
+#include "velox/vector/VectorStream.h"
+
+#include <google/protobuf/arena.h>
+#include <folly/io/Cursor.h>
+#include <folly/io/IOBuf.h>
 
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/CudfPlanValidator.h"
@@ -56,6 +66,107 @@ jmethodID infoClsInitMethod;
 
 jclass blockStripesClass;
 jmethodID blockStripesConstructor;
+
+struct SerializedHashTableBinary {
+  static std::string serialize(const exec::BaseHashTable::SerializedHashTable& table) {
+    google::protobuf::Arena arena;
+    VeloxToSubstraitTypeConvertor typeConvertor;
+    const auto& namedStruct = typeConvertor.toSubstraitNamedStruct(arena, table.info.tableType);
+    std::string schemaBytes;
+    namedStruct.SerializeToString(&schemaBytes);
+
+    std::string output;
+    folly::io::Appender appender(&output, 64);
+    appender.writeBE<uint32_t>(schemaBytes.size());
+    appender.push(schemaBytes.data(), schemaBytes.size());
+    appender.writeBE<uint32_t>(table.info.numKeys);
+    uint8_t flags = 0;
+    if (table.info.ignoreNullKeys) {
+      flags |= 0x1;
+    }
+    if (table.info.allowDuplicates) {
+      flags |= 0x2;
+    }
+    if (table.info.isJoinBuild) {
+      flags |= 0x4;
+    }
+    if (table.info.hasProbedFlag) {
+      flags |= 0x8;
+    }
+    appender.write<uint8_t>(flags);
+    appender.writeBE<uint32_t>(table.info.minTableSizeForParallelJoinBuild);
+    appender.writeBE<uint64_t>(table.serializedRows.size());
+    if (!table.serializedRows.empty()) {
+      appender.push(table.serializedRows.data(), table.serializedRows.size());
+    }
+    return output;
+  }
+
+  static exec::BaseHashTable::SerializedHashTable deserialize(
+      const uint8_t* data,
+      size_t size,
+      memory::MemoryPool* pool) {
+    static_cast<void>(pool);
+    folly::io::Cursor cursor(folly::IOBuf::wrapBuffer(data, size));
+    auto schemaSize = cursor.readBE<uint32_t>();
+    std::string schemaBytes(schemaSize, '\0');
+    if (schemaSize > 0) {
+      cursor.pull(schemaBytes.data(), schemaSize);
+    }
+
+    ::substrait::NamedStruct namedStruct;
+    namedStruct.ParseFromString(schemaBytes);
+    auto types = SubstraitParser::parseNamedStruct(namedStruct);
+    std::vector<std::string> names;
+    names.reserve(namedStruct.names_size());
+    for (const auto& name : namedStruct.names()) {
+      names.emplace_back(name);
+    }
+    auto rowType = ROW(std::move(names), std::move(types));
+
+    exec::BaseHashTable::SerializedHashTable result;
+    result.info.tableType = rowType;
+    result.info.numKeys = cursor.readBE<uint32_t>();
+    auto flags = cursor.read<uint8_t>();
+    result.info.ignoreNullKeys = flags & 0x1;
+    result.info.allowDuplicates = flags & 0x2;
+    result.info.isJoinBuild = flags & 0x4;
+    result.info.hasProbedFlag = flags & 0x8;
+    result.info.minTableSizeForParallelJoinBuild = cursor.readBE<uint32_t>();
+    auto rowsSize = cursor.readBE<uint64_t>();
+    if (rowsSize > 0) {
+      result.serializedRows.resize(rowsSize);
+      cursor.pull(result.serializedRows.data(), rowsSize);
+    }
+    return result;
+  }
+};
+
+template <bool ignoreNullKeys>
+exec::BaseHashTable::SerializedHashTable buildHashTableFromVectors(
+    exec::BaseHashTable::HashTableBuildInfo info,
+    const std::vector<facebook::velox::RowVectorPtr>& vectors,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK(!vectors.empty(), "No data for building hash table");
+  info.tableType = vectors.front()->type()->asRow();
+  auto table = exec::HashTable<ignoreNullKeys>::createEmpty(info, pool);
+  for (const auto& vector : vectors) {
+    exec::HashTable<ignoreNullKeys>::populateContainerFromVector(*table, vector);
+    exec::HashTable<ignoreNullKeys>::updateHasherStatistics(*table, vector);
+  }
+  table->finalizeTableBuild();
+  return table->serialize();
+}
+
+exec::BaseHashTable::SerializedHashTable buildHashTableFromVectors(
+    exec::BaseHashTable::HashTableBuildInfo info,
+    const std::vector<facebook::velox::RowVectorPtr>& vectors,
+    memory::MemoryPool* pool) {
+  if (info.ignoreNullKeys) {
+    return buildHashTableFromVectors<true>(info, vectors, pool);
+  }
+  return buildHashTableFromVectors<false>(info, vectors, pool);
+}
 } // namespace
 
 #ifdef __cplusplus
@@ -209,6 +320,152 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
   auto newBatch = VeloxColumnarBatch::compose(runtime->memoryManager()->getLeafMemoryPool().get(), std::move(batches));
   return ctx->saveObject(newBatch);
   JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_buildSerializedHashTable( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong cSchema,
+    jobjectArray batchArray,
+    jint numKeys,
+    jboolean ignoreNullKeys,
+    jboolean allowDuplicates,
+    jboolean isJoinBuild,
+    jboolean hasProbedFlag,
+    jint minTableSizeForParallelJoinBuild) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  auto pool = runtime->memoryManager()->getLeafMemoryPool().get();
+
+  auto schema = reinterpret_cast<ArrowSchema*>(cSchema);
+  auto serializer = ctx->createColumnarBatchSerializer(schema);
+
+  std::vector<RowVectorPtr> rowVectors;
+  const auto batchCount = env->GetArrayLength(batchArray);
+  rowVectors.reserve(batchCount);
+  for (jsize i = 0; i < batchCount; ++i) {
+    auto batchBytes = static_cast<jbyteArray>(env->GetObjectArrayElement(batchArray, i));
+    if (batchBytes == nullptr) {
+      continue;
+    }
+    auto safeBytes = getByteArrayElementsSafe(env, batchBytes);
+    auto batch = serializer->deserialize(
+        reinterpret_cast<uint8_t*>(safeBytes.elems()), env->GetArrayLength(batchBytes));
+    auto veloxBatch = VeloxColumnarBatch::from(pool, batch);
+    rowVectors.emplace_back(veloxBatch->getRowVector());
+    env->DeleteLocalRef(batchBytes);
+  }
+
+  if (rowVectors.empty()) {
+    return nullptr;
+  }
+
+  exec::BaseHashTable::HashTableBuildInfo info;
+  info.numKeys = numKeys;
+  info.ignoreNullKeys = ignoreNullKeys;
+  info.allowDuplicates = allowDuplicates;
+  info.isJoinBuild = isJoinBuild;
+  info.hasProbedFlag = hasProbedFlag;
+  info.minTableSizeForParallelJoinBuild = minTableSizeForParallelJoinBuild;
+
+  auto serializedTable = buildHashTableFromVectors(info, rowVectors, pool);
+  auto binary = SerializedHashTableBinary::serialize(serializedTable);
+  auto result = env->NewByteArray(binary.size());
+  if (!binary.empty()) {
+    env->SetByteArrayRegion(
+        result, 0, binary.size(), reinterpret_cast<const jbyte*>(binary.data()));
+  }
+  return result;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_deserialize( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jbyteArray serializedHashTable) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  auto pool = runtime->memoryManager()->getLeafMemoryPool().get();
+  auto safeArray = getByteArrayElementsSafe(env, serializedHashTable);
+  auto serialized = SerializedHashTableBinary::deserialize(
+      reinterpret_cast<uint8_t*>(safeArray.elems()), env->GetArrayLength(serializedHashTable), pool);
+  auto hashTable = exec::BaseHashTable::deserialize(serialized, pool);
+  return ctx->saveObject(std::shared_ptr<exec::BaseHashTable>(std::move(hashTable)));
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+namespace {
+RowVectorPtr rowVectorFromSerialized(
+    const exec::BaseHashTable::SerializedHashTable& serialized,
+    memory::MemoryPool* pool) {
+  RowVectorPtr rowsVector;
+  if (!serialized.serializedRows.empty()) {
+    auto iobuf = folly::IOBuf::copyBuffer(
+        serialized.serializedRows.data(), serialized.serializedRows.size());
+    auto ranges = byteRangesFromIOBuf(iobuf.get());
+    auto input = std::make_unique<BufferInputStream>(std::move(ranges));
+    VectorStreamGroup::read(
+        input.get(),
+        pool,
+        serialized.info.tableType,
+        getVectorSerde(),
+        &rowsVector,
+        nullptr);
+  } else {
+    rowsVector = std::dynamic_pointer_cast<RowVector>(
+        BaseVector::create(serialized.info.tableType, 0, pool));
+  }
+  return rowsVector;
+}
+} // namespace
+
+JNIEXPORT jobjectArray JNICALL
+Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_hashTableToColumnarBatches( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong hashTableHandle,
+    jlong cSchema) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  auto pool = runtime->memoryManager()->getLeafMemoryPool().get();
+  auto hashTable = ObjectStore::retrieve<exec::BaseHashTable>(hashTableHandle);
+  VELOX_CHECK_NOT_NULL(hashTable, "HashTable handle is invalid");
+
+  auto serialized = hashTable->serialize();
+  auto rowsVector = rowVectorFromSerialized(serialized, pool);
+
+  auto schema = reinterpret_cast<ArrowSchema*>(cSchema);
+  auto serializer = ctx->createColumnarBatchSerializer(schema);
+
+  std::vector<std::shared_ptr<ColumnarBatch>> batches;
+  batches.emplace_back(std::make_shared<VeloxColumnarBatch>(rowsVector));
+  auto buffer = serializer->serializeColumnarBatches(batches);
+
+  jclass byteArrayClass = env->FindClass("[B");
+  auto result = env->NewObjectArray(1, byteArrayClass, nullptr);
+  auto byteArray = env->NewByteArray(buffer->size());
+  if (buffer->size() > 0) {
+    env->SetByteArrayRegion(
+        byteArray, 0, buffer->size(), reinterpret_cast<const jbyte*>(buffer->data()));
+  }
+  env->SetObjectArrayElement(result, 0, byteArray);
+  env->DeleteLocalRef(byteArrayClass);
+  env->DeleteLocalRef(byteArray);
+  return result;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_VeloxHashTableJniWrapper_close( // NOLINT
+    JNIEnv* env,
+    jobject /*wrapper*/,
+    jlong hashTableHandle) {
+  JNI_METHOD_START
+  ObjectStore::release(hashTableHandle);
+  JNI_METHOD_END()
 }
 
 JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJniWrapper_repeatedThenCompose( // NOLINT
